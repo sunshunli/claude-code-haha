@@ -74,7 +74,7 @@ export function AppShell() {
         />
       )}
       <Sidebar />
-      <main className={`flex-1 flex flex-col overflow-hidden ${isTauri ? 'pt-[38px]' : ''}`}>
+      <main id="content-area" className={`flex-1 flex flex-col overflow-hidden relative ${isTauri ? 'pt-[38px]' : ''}`}>
         <ContentRouter />
       </main>
       <ToastContainer />

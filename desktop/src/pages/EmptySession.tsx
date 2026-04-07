@@ -360,7 +360,7 @@ export function EmptySession() {
                   )}
                 </div>
 
-                <PermissionModeSelector />
+                <PermissionModeSelector workDir={workDir} />
               </div>
 
               <div className="flex items-center gap-3">
