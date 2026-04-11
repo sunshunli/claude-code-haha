@@ -23,6 +23,7 @@ import { SessionStore } from '../common/session-store.js'
 import { AdapterHttpClient, type RecentProject } from '../common/http-client.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
 import { optimizeMarkdownForFeishu } from './markdown-style.js'
+import { extractInboundPayload } from './extract-payload.js'
 
 // ---------- init ----------
 
@@ -769,24 +770,8 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
 // ---------- extract message text ----------
 
 function extractText(content: string, msgType: string): string | null {
-  try {
-    const parsed = JSON.parse(content)
-    if (msgType === 'text') {
-      return parsed.text ?? null
-    }
-    if (msgType === 'post') {
-      const zhContent = parsed.zh_cn?.content ?? parsed.en_us?.content ?? []
-      return zhContent
-        .flat()
-        .filter((n: any) => n.tag === 'text' || n.tag === 'md')
-        .map((n: any) => n.text ?? n.content ?? '')
-        .join('')
-        .trim() || null
-    }
-    return null
-  } catch {
-    return null
-  }
+  const { text } = extractInboundPayload(content, msgType)
+  return text.trim() || null
 }
 
 function isBotMentioned(mentions?: Array<{ id?: { open_id?: string } }>): boolean {
