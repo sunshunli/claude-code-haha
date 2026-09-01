@@ -569,6 +569,18 @@ function isIncludedMcpTool(tool: Tool): boolean {
   )
 }
 
+// Session-side handler invoked after a connection closes (caches are already
+// cleared by then). useManageMCPConnections registers it to update AppState
+// and decide whether to reconnect; it is unregistered on unmount so that
+// shutdown closes never trigger reconnection.
+let onMcpConnectionClosed: ((name: string) => void) | undefined
+
+export function setMcpConnectionClosedHandler(
+  handler: ((name: string) => void) | undefined,
+): void {
+  onMcpConnectionClosed = handler
+}
+
 /**
  * Generates the cache key for a server connection
  * @param name Server name
@@ -1393,6 +1405,8 @@ export const connectToServer = memoize(
         if (originalOnclose) {
           originalOnclose()
         }
+
+        onMcpConnectionClosed?.(name)
       }
 
       const cleanup = async () => {

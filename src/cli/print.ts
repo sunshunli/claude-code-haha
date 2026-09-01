@@ -3217,6 +3217,26 @@ function runHeadlessStreaming(
               ?.config ??
             null
 
+          const markDisabled = (cfg: NonNullable<typeof config>) => {
+            const prefix = getMcpPrefix(serverName)
+            setAppState(prev => ({
+              ...prev,
+              mcp: {
+                ...prev.mcp,
+                clients: prev.mcp.clients.map(c =>
+                  c.name === serverName
+                    ? { name: serverName, type: 'disabled' as const, config: cfg }
+                    : c,
+                ),
+                tools: reject(prev.mcp.tools, t => t.name?.startsWith(prefix)),
+                commands: reject(prev.mcp.commands, c =>
+                  commandBelongsToServer(c, serverName),
+                ),
+                resources: omit(prev.mcp.resources, serverName),
+              },
+            }))
+          }
+
           if (!config) {
             sendControlResponseError(message, `Server not found: ${serverName}`)
           } else if (!enabled) {
@@ -3229,26 +3249,11 @@ function runHeadlessStreaming(
               ...currentAppState.mcp.clients,
             ].find(c => c.name === serverName)
             if (client && client.type === 'connected') {
+              // Closing the connection triggers the close handler, which
+              // clears caches and updates AppState to disabled
               await clearServerCache(serverName, config)
             }
-            // Update appState.mcp to reflect disabled status and remove tools/commands/resources
-            const prefix = getMcpPrefix(serverName)
-            setAppState(prev => ({
-              ...prev,
-              mcp: {
-                ...prev.mcp,
-                clients: prev.mcp.clients.map(c =>
-                  c.name === serverName
-                    ? { name: serverName, type: 'disabled' as const, config }
-                    : c,
-                ),
-                tools: reject(prev.mcp.tools, t => t.name?.startsWith(prefix)),
-                commands: reject(prev.mcp.commands, c =>
-                  commandBelongsToServer(c, serverName),
-                ),
-                resources: omit(prev.mcp.resources, serverName),
-              },
-            }))
+            markDisabled(config)
             sendControlResponseSuccess(message)
           } else {
             // Enabling: persist + reconnect
