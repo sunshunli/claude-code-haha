@@ -325,6 +325,21 @@ export function useManageMCPConnections(
       commands: Command[]
       resources?: ServerResource[]
     }) => {
+      // A connect that completes after the server was disabled (e.g. disable
+      // during a reconnect request) must not resurrect the server: close any
+      // fresh connection, clear its caches, and mark it disabled instead.
+      if (isMcpServerDisabled(client.name)) {
+        if (client.type === 'connected') {
+          void clearServerCache(client.name, client.config)
+        }
+        updateServer({
+          name: client.name,
+          type: 'disabled',
+          config: client.config,
+        })
+        return
+      }
+
       updateServer({ ...client, tools, commands, resources })
 
       // Handle side effects based on client state
@@ -1027,7 +1042,11 @@ export function useManageMCPConnections(
               `Max reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached, giving up`,
             )
             reconnectTimersRef.current.delete(name)
-            updateServer({ ...client, type: 'failed' })
+            if (isMcpServerDisabled(name)) {
+              updateServer({ name, type: 'disabled', config: client.config })
+            } else {
+              updateServer({ ...client, type: 'failed' })
+            }
             return
           }
         }
