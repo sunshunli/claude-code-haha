@@ -327,10 +327,11 @@ export function useManageMCPConnections(
     }) => {
       // A connect that completes after the server was disabled (e.g. disable
       // during a reconnect request) must not resurrect the server: close any
-      // fresh connection, clear its caches, and mark it disabled instead.
+      // fresh connection (its caches are cleared by the close handler) and
+      // mark it disabled instead.
       if (isMcpServerDisabled(client.name)) {
         if (client.type === 'connected') {
-          void clearServerCache(client.name, client.config)
+          void client.cleanup()
         }
         updateServer({
           name: client.name,
