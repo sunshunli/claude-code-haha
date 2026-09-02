@@ -11,6 +11,7 @@ import { handleProvidersApi } from '../api/providers.js'
 import { handleProxyRequest } from '../proxy/handler.js'
 import {
   clearTraceCaptureStateForTests,
+  drainTraceCaptureForTests,
   setTraceAppendBeforeWriteHookForTests,
   traceCaptureService,
 } from '../services/traceCaptureService.js'
@@ -32,6 +33,7 @@ async function setup() {
 }
 
 async function teardown() {
+  await drainTraceCaptureForTests()
   clearTraceCaptureStateForTests()
   if (originalConfigDir !== undefined) {
     process.env.CLAUDE_CONFIG_DIR = originalConfigDir
@@ -42,6 +44,17 @@ async function teardown() {
     process.env.HOME = originalHome
   } else {
     delete process.env.HOME
+  }
+  // The background trace projection may still hold a handle briefly (first
+  // index builds are slower); retry the removal instead of failing the test
+  // on Windows.
+  for (let attempt = 0; attempt < 60; attempt++) {
+    try {
+      await fs.rm(tmpDir, { recursive: true, force: true })
+      return
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
   }
   await fs.rm(tmpDir, { recursive: true, force: true })
 }
@@ -838,6 +851,34 @@ describe('ProviderService', () => {
       expect(env.ANTHROPIC_MODEL).toBe('model-main')
     })
 
+    test('editing an existing provider persists supportsNestedToolResultMedia and reroutes it through the proxy', async () => {
+      const svc = new ProviderService()
+      const added = await svc.addProvider(sampleInput())
+      await svc.activateProvider(added.id)
+
+      // Default: nested media preserved, direct connection.
+      let settings = await readSettings()
+      let env = settings.env as Record<string, string>
+      expect(env.ANTHROPIC_BASE_URL).toBe('https://api.example.com')
+
+      const updated = await svc.updateProvider(added.id, { supportsNestedToolResultMedia: false })
+
+      expect(updated.supportsNestedToolResultMedia).toBe(false)
+
+      settings = await readSettings()
+      env = settings.env as Record<string, string>
+      expect(env.ANTHROPIC_BASE_URL).toContain('127.0.0.1')
+      expect(env.ANTHROPIC_API_KEY).toBe('proxy-managed')
+
+      // Editing back to nested media restores the direct connection.
+      const reverted = await svc.updateProvider(added.id, { supportsNestedToolResultMedia: true })
+      expect(reverted.supportsNestedToolResultMedia).toBe(true)
+
+      settings = await readSettings()
+      env = settings.env as Record<string, string>
+      expect(env.ANTHROPIC_BASE_URL).toBe('https://api.example.com')
+    })
+
     test('updating active provider should override and clear auto compact window', async () => {
       const svc = new ProviderService()
       const added = await svc.addProvider(sampleInput({ autoCompactWindow: 64000 }))
@@ -1525,6 +1566,21 @@ describe('ProviderService', () => {
       expect(active!.baseUrl).toBe(provider.baseUrl)
       expect(active!.apiKey).toBe(provider.apiKey)
       expect(active!.apiFormat).toBe('anthropic')
+    })
+
+    test('should resolve preset default auth for a no-key proxy provider', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        presetId: 'lmstudio',
+        apiKey: '',
+        apiFormat: 'anthropic',
+        supportsNestedToolResultMedia: false,
+      }))
+
+      const config = await svc.getProviderForProxy(provider.id)
+
+      expect(config?.apiKey).toBe('lmstudio')
+      expect(config?.authStrategy).toBe('auth_token_empty_api_key')
     })
 
     test('should return null when ChatGPT Official is the active provider', async () => {
@@ -2365,6 +2421,40 @@ describe('ProviderService', () => {
         expect(calls[1].headers.Authorization).toBeUndefined()
         expect(calls[2].headers['x-api-key']).toBe('sk-dual')
         expect(calls[2].headers.Authorization).toBe('Bearer sk-dual')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('tests the proxy path for Anthropic providers that require media hoisting', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: Array<{ body: Record<string, unknown> }> = []
+      globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ body: JSON.parse(String(init?.body)) as Record<string, unknown> })
+        return new Response(JSON.stringify({
+          type: 'message',
+          model: 'model-main',
+          content: [{ type: 'text', text: 'ok' }],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const result = await svc.testProviderConfig({
+          baseUrl: 'https://api.example.com/anthropic',
+          apiKey: 'sk-api',
+          modelId: 'model-main',
+          authStrategy: 'api_key',
+          apiFormat: 'anthropic',
+          supportsNestedToolResultMedia: false,
+        })
+
+        expect(result.connectivity.success).toBe(true)
+        expect(result.proxy?.success).toBe(true)
+        expect(calls).toHaveLength(2)
       } finally {
         globalThis.fetch = originalFetch
       }
