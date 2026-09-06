@@ -20,6 +20,34 @@ describe('transformMCPResult media handling', () => {
     expect(JSON.stringify(transformed.content)).not.toContain('Structured content')
   })
 
+  test('deduplicates JSON-equivalent arrays and detects unequal arrays', async () => {
+    const equivalent = await transformMCPResult({
+      content: [{ type: 'text', text: '[1, {"ok": true}]' }],
+      structuredContent: [1, { ok: true }],
+    }, 'test-tool', 'test-server')
+    const unequal = await transformMCPResult({
+      content: [{ type: 'text', text: '[1, {"ok": false}]' }],
+      structuredContent: [1, { ok: true }],
+    }, 'test-tool', 'test-server')
+
+    expect(equivalent.content).toEqual([{ type: 'text', text: '[1, {"ok": true}]' }])
+    expect(unequal.content).toEqual([
+      { type: 'text', text: '[1, {"ok": false}]' },
+      { type: 'text', text: 'Structured content:\n[1,{"ok":true}]' },
+    ])
+  })
+
+  test('does not treat arrays and objects as JSON-equivalent', async () => {
+    const transformed = await transformMCPResult({
+      content: [{ type: 'text', text: '{"0":"value"}' }],
+      structuredContent: ['value'],
+    }, 'test-tool', 'test-server')
+
+    expect(transformed.content).toEqual([
+      { type: 'text', text: '{"0":"value"}' },
+      { type: 'text', text: 'Structured content:\n["value"]' },
+    ])
+  })
   test('keeps images in content and appends structuredContent when not already serialized', async () => {
     const result = {
       content: [{ type: 'image', data: ONE_PX_PNG, mimeType: 'image/png' }],

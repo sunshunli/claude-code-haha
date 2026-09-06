@@ -460,6 +460,56 @@ describe('proxy anthropic-compatible path', () => {
     }
   })
 
+  test('uses both API key and Bearer auth for dual_same_token strategy', async () => {
+    const svc = new ProviderService()
+    const provider = await svc.addProvider({
+      presetId: 'custom',
+      name: 'Anthropic Dual Auth',
+      baseUrl: 'https://relay.example.com',
+      apiKey: 'sk-dual',
+      apiFormat: 'anthropic',
+      authStrategy: 'dual_same_token',
+      supportsNestedToolResultMedia: false,
+      models: { main: 'model-main', haiku: 'model-main', sonnet: 'model-main', opus: 'model-main' },
+    })
+
+    const originalFetch = globalThis.fetch
+    let forwardedHeaders: Record<string, string> | undefined
+    globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+      forwardedHeaders = init?.headers as Record<string, string>
+      return new Response(JSON.stringify({
+        id: 'msg_dual',
+        type: 'message',
+        role: 'assistant',
+        model: 'model-main',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as typeof fetch
+
+    try {
+      const req = new Request(
+        `http://localhost:3456/proxy/providers/${provider.id}/v1/messages`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({
+            model: 'model-main',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+        },
+      )
+
+      expect((await handleProxyRequest(req, new URL(req.url))).status).toBe(200)
+      expect(forwardedHeaders?.['x-api-key']).toBe('sk-dual')
+      expect(forwardedHeaders?.Authorization).toBe('Bearer sk-dual')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   test('passes upstream error bodies and headers through unchanged', async () => {
     const svc = new ProviderService()
     const provider = await svc.addProvider({

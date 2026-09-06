@@ -2118,15 +2118,20 @@ describe('ProviderService', () => {
       })
 
       const messages = body.messages as Array<Record<string, unknown>>
-      expect(messages[0]).toEqual({
-        role: 'tool',
-        tool_call_id: 'computer_1',
-        content: [
-          { type: 'text', text: 'Computer Use state' },
-          { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,/9j/AA==' } },
-          { type: 'text', text: 'After screenshot' },
-        ],
-      })
+      expect(messages).toEqual([
+        {
+          role: 'tool',
+          tool_call_id: 'computer_1',
+          content: 'Computer Use stateAfter screenshot',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '[Media content for tool call computer_1]' },
+            { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,/9j/AA==' } },
+          ],
+        },
+      ])
     })
 
     test.each([
@@ -2154,7 +2159,7 @@ describe('ProviderService', () => {
       expect(messages[0]).toEqual({
         role: 'tool',
         tool_call_id: 'computer_1',
-        content: '[Image omitted: this OpenAI-compatible chat endpoint only supports text content.]',
+        content: '\n[Image omitted: this OpenAI-compatible chat endpoint only supports text content.]\n',
       })
       expect(JSON.stringify(body)).not.toContain('private-screenshot-data')
       expect(JSON.stringify(body)).not.toContain('image_url')
@@ -2171,14 +2176,20 @@ describe('ProviderService', () => {
       })
 
       const messages = body.messages as Array<Record<string, unknown>>
-      expect(messages[0]).toEqual({
-        role: 'tool',
-        tool_call_id: 'computer_1',
-        content: [{
-          type: 'image_url',
-          image_url: { url: 'data:image/png;base64,generic-image-data' },
-        }],
-      })
+      expect(messages).toEqual([
+        {
+          role: 'tool',
+          tool_call_id: 'computer_1',
+          content: 'Media result attached after this tool result.',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '[Media content for tool call computer_1]' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,generic-image-data' } },
+          ],
+        },
+      ])
     })
 
     test('normalizes context-window suffixes before forwarding OpenAI Chat proxy requests', async () => {

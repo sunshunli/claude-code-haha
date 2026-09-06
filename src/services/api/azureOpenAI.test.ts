@@ -4,7 +4,7 @@ import {
   parseAzureOpenAIResponse,
   resolveAzureOpenAIEndpoint,
   resolveAzureOpenAIDeployment,
-} from "../src/services/api/azureOpenAI.js"
+} from "./azureOpenAI.js"
 
 test("resolveAzureOpenAIEndpoint appends responses path and api-version", () => {
   const prevBase = process.env.AZURE_OPENAI_BASE_URL
@@ -482,4 +482,81 @@ test("buildAzureOpenAIInput keeps inline images of custom-content documents", ()
       { type: "input_text", text: "after" },
     ],
   }])
+})
+
+test("buildAzureOpenAIInput preserves mixed block ordering", () => {
+  const input = buildAzureOpenAIInput([
+    { type: "system", message: { content: "ignored" } },
+    { type: "user", message: { content: "plain user text" } },
+    { type: "assistant", message: { content: [{ type: "text", text: "before" }, null, { ignored: true }, { type: "tool_use", id: "call_1", name: "lookup", input: "{\"q\":1}" }, { type: "text", text: "after" }] } },
+    { type: "user", message: { content: [{ type: "text", text: "prefix" }, { type: "tool_result", tool_use_id: "call_1", content: "done" }, { type: "text", text: "suffix" }] } },
+  ])
+
+  expect(input).toEqual([
+    { type: "message", role: "user", content: "plain user text" },
+    { type: "message", role: "assistant", content: "before" },
+    { type: "function_call", call_id: "call_1", name: "lookup", arguments: "{\"q\":1}" },
+    { type: "message", role: "assistant", content: "after" },
+    { type: "message", role: "user", content: "prefix" },
+    { type: "function_call_output", call_id: "call_1", output: "done" },
+    { type: "message", role: "user", content: "suffix" },
+  ])
+})
+
+test("buildAzureOpenAIInput preserves document context across custom and file sources", () => {
+  const input = buildAzureOpenAIInput([{
+    type: "user",
+    message: { content: [
+      { type: "document", context: "inline context", source: { type: "content", content: "inline body" } },
+      { type: "document", title: "local.pdf", context: "local context", source: { type: "file", file_id: "file_1" } },
+      { type: "document", context: "remote context", source: { type: "url", url: "https://example.test/remote.pdf" } },
+    ] },
+  }])
+
+  expect(input).toEqual([{
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text: "[Document context: inline context]\n" },
+      { type: "input_text", text: "inline body" },
+      { type: "input_text", text: "[Document context: local context]\n[Document: local.pdf omitted — file-based source]" },
+      { type: "input_text", text: "[Document context: remote context]\n[Document: https://example.test/remote.pdf](https://example.test/remote.pdf)" },
+    ],
+  }])
+})
+
+test("buildAzureOpenAIInput ignores malformed and empty media blocks", () => {
+  const input = buildAzureOpenAIInput([{
+    type: "user",
+    message: { content: [
+      null,
+      { type: "search_result", content: [{ type: "citation" }] },
+      { type: "image", source: { type: "base64" } },
+      { type: "document", source: { type: "content", content: "" } },
+      { type: "document", source: { type: "content", content: [{ type: "unknown" }] } },
+    ] },
+  }])
+
+  expect(input).toEqual([])
+})
+
+test("parseAzureOpenAIResponse maps text variants and empty responses", () => {
+  expect(parseAzureOpenAIResponse({
+    id: "resp_text",
+    status: "incomplete",
+    output: [
+      { type: "message", content: [null, { type: "output_text", text: "first" }, { type: "text", text: "second" }] },
+      null,
+    ],
+    usage: { prompt_tokens: 3, completion_tokens: 4 },
+  })).toEqual({
+    content: [{ type: "text", text: "first" }, { type: "text", text: "second" }],
+    usage: { input_tokens: 3, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    responseId: "resp_text",
+    stopReason: "max_tokens",
+  })
+
+  expect(parseAzureOpenAIResponse({ output_text: "fallback" }).content).toEqual([
+    { type: "text", text: "fallback" },
+  ])
 })
