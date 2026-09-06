@@ -256,6 +256,7 @@ import {
   ElicitRequestSchema,
   ElicitationCompleteNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import { disableStaleMcpReconnect } from './mcpReconnectState.js'
 import { getMcpPrefix } from 'src/services/mcp/mcpStringUtils.js'
 import {
   commandBelongsToServer,
@@ -3462,48 +3463,17 @@ function runHeadlessStreaming(
                   // flight, close any fresh connection and keep the disabled
                   // state
                   if (isMcpServerDisabled(serverName)) {
-                    if (result.client.type === 'connected') {
-                      // Close the fresh connection in the background; its
-                      // caches are cleared by the close handler at close
-                      // time, so no post-close invalidation can hit a
-                      // connection created by a concurrent re-enable.
-                      void result.client.cleanup()
-                    }
-                    const prefix = getMcpPrefix(serverName)
-                    setAppState(prev => ({
-                      ...prev,
-                      mcp: {
-                        ...prev.mcp,
-                        clients: prev.mcp.clients.map(c =>
-                          c.name === serverName
-                            ? {
-                                name: serverName,
-                                type: 'disabled' as const,
-                                config,
-                              }
-                            : c,
-                        ),
-                        tools: reject(prev.mcp.tools, t =>
-                          t.name?.startsWith(prefix),
-                        ),
-                        commands: reject(prev.mcp.commands, c =>
-                          commandBelongsToServer(c, serverName),
-                        ),
-                        resources: omit(prev.mcp.resources, serverName),
-                      },
-                    }))
-                    dynamicMcpState = {
-                      ...dynamicMcpState,
-                      clients: [
-                        ...dynamicMcpState.clients.filter(
-                          c => c.name !== serverName,
-                        ),
-                        { name: serverName, type: 'disabled' as const, config },
-                      ],
-                      tools: dynamicMcpState.tools.filter(
-                        t => !t.name?.startsWith(prefix),
-                      ),
-                    }
+                    setAppState(prev => {
+                      const disabled = disableStaleMcpReconnect(
+                        serverName,
+                        config,
+                        result.client,
+                        prev.mcp,
+                        dynamicMcpState,
+                      )
+                      dynamicMcpState = disabled.dynamic
+                      return { ...prev, mcp: disabled.mcp }
+                    })
                     return
                   }
                   const prefix = getMcpPrefix(serverName)

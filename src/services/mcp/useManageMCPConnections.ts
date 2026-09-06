@@ -89,6 +89,26 @@ const MAX_RECONNECT_ATTEMPTS = 5
 const INITIAL_BACKOFF_MS = 1000
 const MAX_BACKOFF_MS = 30000
 
+type DisabledConnectionUpdate = Extract<MCPServerConnection, { type: 'disabled' }>
+
+export function discardConnectionAttemptIfDisabled(
+  client: MCPServerConnection,
+  isDisabled: boolean,
+  updateServer: (update: DisabledConnectionUpdate) => void,
+): boolean {
+  if (!isDisabled) return false
+
+  if (client.type === 'connected') {
+    void client.cleanup()
+  }
+  updateServer({
+    name: client.name,
+    type: 'disabled',
+    config: client.config,
+  })
+  return true
+}
+
 /**
  * Create a unique key for a plugin error to enable deduplication
  */
@@ -329,15 +349,13 @@ export function useManageMCPConnections(
       // during a reconnect request) must not resurrect the server: close any
       // fresh connection (its caches are cleared by the close handler) and
       // mark it disabled instead.
-      if (isMcpServerDisabled(client.name)) {
-        if (client.type === 'connected') {
-          void client.cleanup()
-        }
-        updateServer({
-          name: client.name,
-          type: 'disabled',
-          config: client.config,
-        })
+      if (
+        discardConnectionAttemptIfDisabled(
+          client,
+          isMcpServerDisabled(client.name),
+          updateServer,
+        )
+      ) {
         return
       }
 

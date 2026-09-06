@@ -581,6 +581,10 @@ export function setMcpConnectionClosedHandler(
   onMcpConnectionClosed = handler
 }
 
+export function notifyMcpConnectionClosed(name: string): void {
+  onMcpConnectionClosed?.(name)
+}
+
 /**
  * Generates the cache key for a server connection
  * @param name Server name
@@ -1406,7 +1410,7 @@ export const connectToServer = memoize(
           originalOnclose()
         }
 
-        onMcpConnectionClosed?.(name)
+        notifyMcpConnectionClosed(name)
       }
 
       const cleanup = async () => {
