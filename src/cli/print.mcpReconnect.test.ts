@@ -175,10 +175,8 @@ describe('headless MCP reconnect races', () => {
       type: 'control_response',
       response: { request_id: 'reconnect-1', subtype: 'success' },
     })
-    expect(clearServerCache).toHaveBeenCalledWith(
-      'test-server',
-      { type: 'sse', url: 'https://example.com/mcp' },
-    )
+    expect(cleanup).toHaveBeenCalledTimes(1)
+    expect(clearServerCache).not.toHaveBeenCalled()
     expect(getState().mcp.clients[0]?.type).toBe('disabled')
     expect(getState().mcp.clients[1]?.name).toBe('other-server')
     input.done()
@@ -207,10 +205,8 @@ describe('headless MCP reconnect races', () => {
       type: 'control_response',
       response: { request_id: 'toggle-1', subtype: 'success' },
     })
-    expect(clearServerCache).toHaveBeenCalledWith(
-      'test-server',
-      { type: 'sse', url: 'https://example.com/mcp' },
-    )
+    expect(cleanup).toHaveBeenCalledTimes(1)
+    expect(clearServerCache).not.toHaveBeenCalled()
     expect(getState().mcp.clients[0]?.type).toBe('disabled')
     expect(getState().mcp.clients[1]?.name).toBe('other-server')
     input.done()
@@ -333,3 +329,64 @@ describe('headless MCP reconnect races', () => {
     input.done()
   })
 })
+
+test.each(['mcp_reconnect', 'mcp_toggle'] as const)(
+  'preserves a later enable while stale %s cleanup is pending',
+  async subtype => {
+    let finishCleanup!: () => void
+    const cleanupFinished = new Promise<void>(resolve => { finishCleanup = resolve })
+    cleanup.mockImplementationOnce(() => cleanupFinished)
+    const input = new Stream<string>()
+    const { output, getState } = startHeadless(input)
+    const iterator = output[Symbol.asyncIterator]()
+    const nextResponse = async () => {
+      while (true) {
+        const { value, done } = await iterator.next()
+        if (done) throw new Error('Missing control response')
+        if (value.type === 'control_response') return value
+      }
+    }
+    try {
+      input.enqueue(`${JSON.stringify({
+        type: 'control_request',
+        request_id: 'old-reconnect',
+        request: subtype === 'mcp_reconnect'
+          ? { subtype, serverName: 'test-server' }
+          : { subtype, serverName: 'test-server', enabled: true },
+      })}\n`)
+      await Bun.sleep(0)
+      isDisabled = true
+      resolveReconnect?.(reconnectResult())
+      // Cleanup may wait on transport shutdown. It must not postpone the
+      // disabled state write into a future enable operation.
+      const response = nextResponse()
+      const responded = await Promise.race([
+        response.then(() => true),
+        Bun.sleep(100).then(() => false),
+      ])
+      expect(responded).toBe(true)
+      expect(getState().mcp.clients[0]?.type).toBe('disabled')
+      input.enqueue(`${JSON.stringify({
+        type: 'control_request',
+        request_id: 'new-enable',
+        request: { subtype: 'mcp_toggle', serverName: 'test-server', enabled: true },
+      })}\n`)
+      await Bun.sleep(0)
+      const newer = connectedClient()
+      resolveReconnect?.(reconnectResult(newer, true))
+      await nextResponse()
+      expect(isDisabled).toBe(false)
+      expect(getState().mcp.clients[0]).toBe(newer)
+      finishCleanup()
+      await cleanupFinished
+      await Bun.sleep(0)
+      expect(getState().mcp.clients[0]).toBe(newer)
+      expect(getState().mcp.tools).toHaveLength(1)
+      expect(getState().mcp.commands).toHaveLength(1)
+      expect(getState().mcp.resources['test-server']).toHaveLength(1)
+    } finally {
+      finishCleanup()
+      input.done()
+    }
+  },
+)

@@ -3154,7 +3154,7 @@ function runHeadlessStreaming(
             // close any fresh connection and keep the disabled state
             if (isMcpServerDisabled(serverName)) {
               if (result.client.type === 'connected') {
-                await clearServerCache(serverName, config)
+                void result.client.cleanup()
               }
               const prefix = getMcpPrefix(serverName)
               setAppState(prev => ({
@@ -3296,12 +3296,10 @@ function runHeadlessStreaming(
               ...dynamicMcpState.clients,
               ...currentAppState.mcp.clients,
             ].find(c => c.name === serverName)
+            markDisabled(config)
             if (client && client.type === 'connected') {
-              // Closing the connection triggers the close handler, which
-              // clears caches and updates AppState to disabled
               await clearServerCache(serverName, config)
             }
-            markDisabled(config)
             sendControlResponseSuccess(message)
           } else {
             // Enabling: persist + reconnect
@@ -3311,7 +3309,7 @@ function runHeadlessStreaming(
             // close any fresh connection and keep the disabled state
             if (isMcpServerDisabled(serverName)) {
               if (result.client.type === 'connected') {
-                await clearServerCache(serverName, config)
+                void result.client.cleanup()
               }
               markDisabled(config)
               sendControlResponseSuccess(message)

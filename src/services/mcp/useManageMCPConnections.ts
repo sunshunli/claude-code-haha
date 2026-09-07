@@ -15,6 +15,7 @@ import {
 } from './client.js'
 import type {
   MCPServerConnection,
+  ConnectedMCPServer,
   ScopedMcpServerConfig,
   ServerResource,
 } from './types.js'
@@ -1093,9 +1094,13 @@ export function useManageMCPConnections(
   // Handle connection closes: update AppState to disabled when the config no
   // longer allows the server, otherwise attempt reconnection.
   const handleConnectionClosed = useCallback(
-    (name: string) => {
+    (name: string, closedClient: ConnectedMCPServer['client']) => {
       const client = store.getState().mcp.clients.find(c => c.name === name)
-      if (!client || client.type !== 'connected') return
+      if (
+        !client ||
+        client.type !== 'connected' ||
+        client.client !== closedClient
+      ) return
 
       if (isMcpServerDisabled(name)) {
         updateServer({ name, type: 'disabled', config: client.config })

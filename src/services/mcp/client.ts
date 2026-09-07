@@ -573,16 +573,29 @@ function isIncludedMcpTool(tool: Tool): boolean {
 // cleared by then). useManageMCPConnections registers it to update AppState
 // and decide whether to reconnect; it is unregistered on unmount so that
 // shutdown closes never trigger reconnection.
-let onMcpConnectionClosed: ((name: string) => void) | undefined
+let onMcpConnectionClosed: ((name: string, client: Client) => void) | undefined
+
+// A delayed close belongs to its connection attempt, not whichever connection
+// currently has the same server name (including a changed configuration).
+const connectionAttempts = new Map<string, { key: string }>()
 
 export function setMcpConnectionClosedHandler(
-  handler: ((name: string) => void) | undefined,
+  handler: ((name: string, client: Client) => void) | undefined,
 ): void {
   onMcpConnectionClosed = handler
 }
 
-export function notifyMcpConnectionClosed(name: string): void {
-  onMcpConnectionClosed?.(name)
+export function notifyMcpConnectionClosed(name: string, client: Client): void {
+  onMcpConnectionClosed?.(name, client)
+}
+
+function clearServerFetchCaches(name: string): void {
+  fetchToolsForClient.cache.delete(name)
+  fetchResourcesForClient.cache.delete(name)
+  fetchCommandsForClient.cache.delete(name)
+  if (feature('MCP_SKILLS')) {
+    fetchMcpSkillsForClient!.cache.delete(name)
+  }
 }
 
 /**
@@ -619,6 +632,8 @@ export const connectToServer = memoize(
     },
   ): Promise<MCPServerConnection> => {
     const connectStartTime = Date.now()
+    const attempt = { key: getServerCacheKey(name, serverRef) }
+    connectionAttempts.set(name, attempt)
     let inProcessServer:
       | { connect(t: Transport): Promise<void>; close(): Promise<void> }
       | undefined
@@ -1380,6 +1395,8 @@ export const connectToServer = memoize(
         }
       }
 
+      let closingIntentionally = false
+
       // Enhanced close handler with connection drop context
       client.onclose = () => {
         const uptime = Date.now() - connectionStartTime
@@ -1390,30 +1407,18 @@ export const connectToServer = memoize(
           `${transportType.toUpperCase()} connection closed after ${Math.floor(uptime / 1000)}s (${hasErrorOccurred ? 'with errors' : 'cleanly'})`,
         )
 
-        // Clear the memoization cache so next operation reconnects
-        const key = getServerCacheKey(name, serverRef)
-
-        // Also clear fetch caches (keyed by server name). Reconnection
-        // creates a new connection object; without clearing, the next
-        // fetch would return stale tools/resources from the old connection.
-        fetchToolsForClient.cache.delete(name)
-        fetchResourcesForClient.cache.delete(name)
-        fetchCommandsForClient.cache.delete(name)
-        if (feature('MCP_SKILLS')) {
-          fetchMcpSkillsForClient!.cache.delete(name)
-        }
-
-        connectToServer.cache.delete(key)
+        originalOnclose?.()
+        if (connectionAttempts.get(name) !== attempt) return
+        connectionAttempts.delete(name)
+        clearServerFetchCaches(name)
+        connectToServer.cache.delete(attempt.key)
         logMCPDebug(name, `Cleared connection cache for reconnection`)
 
-        if (originalOnclose) {
-          originalOnclose()
-        }
-
-        notifyMcpConnectionClosed(name)
+        if (!closingIntentionally) notifyMcpConnectionClosed(name, client)
       }
 
       const cleanup = async () => {
+        closingIntentionally = true
         // In-process servers (e.g. Chrome MCP) don't have child processes or stderr
         if (inProcessServer) {
           try {
@@ -1662,25 +1667,17 @@ export async function clearServerCache(
   serverRef: ScopedMcpServerConfig,
 ): Promise<void> {
   const key = getServerCacheKey(name, serverRef)
+  const cached = connectToServer.cache.get(key)
+  // Detach before awaiting cleanup: a concurrent enable owns its own cache
+  // entry, and clearing an empty cache must never start a new server.
+  connectToServer.cache.delete(key)
+  if (connectionAttempts.get(name)?.key === key) clearServerFetchCaches(name)
 
   try {
-    const wrappedClient = await connectToServer(name, serverRef)
-
-    if (wrappedClient.type === 'connected') {
-      await wrappedClient.cleanup()
-    }
+    const wrappedClient = await cached
+    if (wrappedClient?.type === 'connected') await wrappedClient.cleanup()
   } catch {
     // Ignore errors - server might have failed to connect
-  }
-
-  // Clear from cache (both connection and fetch caches so reconnect
-  // fetches fresh tools/resources/commands instead of stale ones)
-  connectToServer.cache.delete(key)
-  fetchToolsForClient.cache.delete(name)
-  fetchResourcesForClient.cache.delete(name)
-  fetchCommandsForClient.cache.delete(name)
-  if (feature('MCP_SKILLS')) {
-    fetchMcpSkillsForClient!.cache.delete(name)
   }
 }
 

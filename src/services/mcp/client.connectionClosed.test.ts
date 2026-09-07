@@ -1,8 +1,11 @@
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { afterEach, describe, expect, mock, test } from 'bun:test'
 import {
   notifyMcpConnectionClosed,
   setMcpConnectionClosedHandler,
 } from './client.js'
+
+const client = {} as Client
 
 afterEach(() => {
   setMcpConnectionClosedHandler(undefined)
@@ -13,9 +16,9 @@ describe('MCP connection close handler', () => {
     const handler = mock(() => {})
     setMcpConnectionClosedHandler(handler)
 
-    notifyMcpConnectionClosed('test-server')
+    notifyMcpConnectionClosed('test-server', client)
 
-    expect(handler).toHaveBeenCalledWith('test-server')
+    expect(handler).toHaveBeenCalledWith('test-server', client)
   })
 
   test('uses the latest handler and stops notifying after unregister', () => {
@@ -24,9 +27,9 @@ describe('MCP connection close handler', () => {
     setMcpConnectionClosedHandler(staleHandler)
     setMcpConnectionClosedHandler(activeHandler)
 
-    notifyMcpConnectionClosed('test-server')
+    notifyMcpConnectionClosed('test-server', client)
     setMcpConnectionClosedHandler(undefined)
-    notifyMcpConnectionClosed('test-server')
+    notifyMcpConnectionClosed('test-server', client)
 
     expect(staleHandler).not.toHaveBeenCalled()
     expect(activeHandler).toHaveBeenCalledTimes(1)

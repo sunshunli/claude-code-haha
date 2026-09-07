@@ -11,7 +11,7 @@ const clientModule = await import('./client.js')
 const configModule = await import('./config.js')
 
 let state: AppState
-let closeHandler: ((name: string) => void) | undefined
+let closeHandler: ((name: string, client: ConnectedMCPServer['client']) => void) | undefined
 let isDisabled = true
 let transportType: 'sse' | 'stdio' = 'sse'
 const reconnectMcpServerImpl = mock(async () => ({
@@ -56,8 +56,10 @@ mock.module('./config.js', () => ({
 
 const { useManageMCPConnections } = await import('./useManageMCPConnections.js')
 
+let actions: ReturnType<typeof useManageMCPConnections>
+
 function Harness() {
-  useManageMCPConnections(undefined)
+  actions = useManageMCPConnections(undefined)
   return null
 }
 
@@ -113,7 +115,7 @@ describe('useManageMCPConnections close lifecycle', () => {
     await Bun.sleep(0)
 
     expect(closeHandler).toBeDefined()
-    closeHandler?.('test-server')
+    closeHandler?.('test-server', (state.mcp.clients[0] as ConnectedMCPServer).client)
     await Bun.sleep(20)
 
     expect(state.mcp.clients).toContainEqual({
@@ -135,7 +137,7 @@ describe('useManageMCPConnections close lifecycle', () => {
     })
     await Bun.sleep(0)
 
-    closeHandler?.('test-server')
+    closeHandler?.('test-server', (state.mcp.clients[0] as ConnectedMCPServer).client)
     await Bun.sleep(20)
 
     expect(reconnectMcpServerImpl).toHaveBeenCalledWith(
@@ -162,7 +164,7 @@ describe('useManageMCPConnections close lifecycle', () => {
     })
     await Bun.sleep(0)
 
-    closeHandler?.('test-server')
+    closeHandler?.('test-server', (state.mcp.clients[0] as ConnectedMCPServer).client)
     await Bun.sleep(20)
 
     expect(reconnectMcpServerImpl).not.toHaveBeenCalled()
@@ -182,7 +184,7 @@ describe('useManageMCPConnections close lifecycle', () => {
     await Bun.sleep(0)
 
     isDisabled = true
-    closeHandler?.('test-server')
+    closeHandler?.('test-server', (state.mcp.clients[0] as ConnectedMCPServer).client)
     await Bun.sleep(20)
 
     expect(reconnectMcpServerImpl).not.toHaveBeenCalled()
@@ -212,7 +214,7 @@ describe('useManageMCPConnections close lifecycle', () => {
     })
     await Bun.sleep(0)
 
-    closeHandler?.('test-server')
+    closeHandler?.('test-server', (state.mcp.clients[0] as ConnectedMCPServer).client)
     await Bun.sleep(15_100)
 
     expect(reconnectMcpServerImpl).toHaveBeenCalledTimes(5)
@@ -232,7 +234,7 @@ describe('useManageMCPConnections close lifecycle', () => {
     })
     await Bun.sleep(0)
 
-    closeHandler?.('test-server')
+    closeHandler?.('test-server', (state.mcp.clients[0] as ConnectedMCPServer).client)
     await Bun.sleep(15_100)
 
     expect(reconnectMcpServerImpl).toHaveBeenCalledTimes(5)
@@ -256,4 +258,32 @@ describe('useManageMCPConnections close lifecycle', () => {
 
     expect(closeHandler).toBeUndefined()
   })
+})
+
+
+test('ignores a previous connection close after an explicit reconnect', async () => {
+  isDisabled = false
+  const previous = state.mcp.clients[0] as ConnectedMCPServer
+  const app = render(<Harness />, {
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    stdin: new PassThrough(),
+    exitOnCtrlC: false,
+    patchConsole: false,
+  })
+  try {
+    await Bun.sleep(0)
+    await actions.reconnectMcpServer('test-server')
+    await Bun.sleep(20)
+    const current = state.mcp.clients[0] as ConnectedMCPServer
+    expect(current.type).toBe('connected')
+    expect(current.client).not.toBe(previous.client)
+    expect(reconnectMcpServerImpl).toHaveBeenCalledTimes(1)
+    closeHandler?.('test-server', previous.client)
+    await Bun.sleep(20)
+    expect(reconnectMcpServerImpl).toHaveBeenCalledTimes(1)
+    expect(state.mcp.clients[0]).toBe(current)
+  } finally {
+    app.unmount()
+  }
 })
