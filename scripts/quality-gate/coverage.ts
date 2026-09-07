@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, sep, win32 } from 'node:path'
 import { rootBunTestFilter } from '../pr/bun-test-filter'
@@ -448,29 +448,35 @@ export function hasUsableCoverageSummary(summary: CoverageSummary) {
   return Object.values(summary).some((coverage) => coverage.total > 0)
 }
 
-async function runCommand(command: string[], cwd: string, logPath: string) {
+export async function runCommand(command: string[], cwd: string, logPath: string) {
   const started = Date.now()
   const sandboxHome = mkdtempSync(join(tmpdir(), 'cc-haha-coverage-test-'))
+  const header = `$ ${command.join(' ')}\n`
+  let logFd: number | undefined
   try {
+    mkdirSync(dirname(logPath), { recursive: true })
+    logFd = openSync(logPath, 'w')
+    writeFileSync(logFd, header)
+    // Bun's synchronous text coverage reporter can fail while writing a large
+    // report to a pipe, before it emits LCOV or its test-count summary. Give
+    // both streams a regular file descriptor, with no pipe buffer to exhaust.
     const proc = Bun.spawn(command, {
       cwd,
       env: createSandboxedTestEnvironment(sandboxHome),
-      stdout: 'pipe',
-      stderr: 'pipe',
+      stdout: logFd,
+      stderr: logFd,
     })
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ])
-    mkdirSync(dirname(logPath), { recursive: true })
-    writeFileSync(logPath, `$ ${command.join(' ')}\n${stdout}${stderr}`)
+    const exitCode = await proc.exited
+    closeSync(logFd)
+    logFd = undefined
+    const output = readFileSync(logPath, 'utf8').slice(header.length)
     return {
       exitCode,
       durationMs: Date.now() - started,
-      output: `${stdout}${stderr}`,
+      output,
     }
   } finally {
+    if (logFd !== undefined) closeSync(logFd)
     rmSync(sandboxHome, { recursive: true, force: true })
   }
 }
