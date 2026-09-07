@@ -70,15 +70,26 @@ describe('PR quality workflow', () => {
     }
   })
 
-  test('installs adapter dependencies before root server tests that import adapters', () => {
+  test('installs imported workspace dependencies and ripgrep before runtime and coverage tests', () => {
     const jobs = workflowJobs(readFileSync('.github/workflows/pr-quality.yml', 'utf8'))
-    const steps = jobs['server-checks'].steps ?? []
-    const adapterInstall = steps.findIndex(step =>
-      step['working-directory'] === 'adapters' && step.run === 'bun install --frozen-lockfile',
-    )
-    const serverCheck = steps.findIndex(step => step.run === 'bun run check:server')
-    expect(adapterInstall).toBeGreaterThanOrEqual(0)
-    expect(adapterInstall).toBeLessThan(serverCheck)
+    for (const [job, command] of [
+      ['server-checks', 'bun run check:server'],
+      ['coverage-checks', 'bun run check:coverage'],
+    ]) {
+      const steps = jobs[job].steps ?? []
+      const check = steps.findIndex(step => step.run === command)
+      expect(check).toBeGreaterThanOrEqual(0)
+      for (const workspace of ['desktop', 'adapters']) {
+        const install = steps.findIndex(step =>
+          step['working-directory'] === workspace && step.run === 'bun install --frozen-lockfile',
+        )
+        expect(install).toBeGreaterThanOrEqual(0)
+        expect(install).toBeLessThan(check)
+      }
+      const ripgrep = steps.findIndex(step => step.run?.includes('apt-get install -y ripgrep'))
+      expect(ripgrep).toBeGreaterThanOrEqual(0)
+      expect(ripgrep).toBeLessThan(check)
+    }
   })
 
   test('keeps coverage artifacts observable in CI', () => {
