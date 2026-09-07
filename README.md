@@ -1,10 +1,7 @@
 # Claude Code Haha
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-horizontal-dark.png">
-    <img src="docs/images/logo-horizontal.png" alt="Claude Code Haha" width="480">
-  </picture>
+  <img src="docs/images/readme-cover-zh.jpg" alt="cc-haha — Claude Code 开源桌面端" width="960">
 </p>
 
 <div align="center">

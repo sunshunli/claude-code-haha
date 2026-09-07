@@ -4,7 +4,7 @@ import { parse } from 'yaml'
 
 type WorkflowJob = {
   needs?: string | string[]
-  steps?: Array<{ name?: string; run?: string }>
+  steps?: Array<{ name?: string; run?: string; 'working-directory'?: string }>
 }
 
 function workflowJobs(workflow: string) {
@@ -67,6 +67,28 @@ describe('PR quality workflow', () => {
       'coverage-checks',
     ]) {
       expect(jobs[jobId].needs).toBe('scope-plan')
+    }
+  })
+
+  test('installs imported workspace dependencies and ripgrep before runtime and coverage tests', () => {
+    const jobs = workflowJobs(readFileSync('.github/workflows/pr-quality.yml', 'utf8'))
+    for (const [job, command] of [
+      ['server-checks', 'bun run check:server'],
+      ['coverage-checks', 'bun run check:coverage'],
+    ]) {
+      const steps = jobs[job].steps ?? []
+      const check = steps.findIndex(step => step.run === command)
+      expect(check).toBeGreaterThanOrEqual(0)
+      for (const workspace of ['desktop', 'adapters']) {
+        const install = steps.findIndex(step =>
+          step['working-directory'] === workspace && step.run === 'bun install --frozen-lockfile',
+        )
+        expect(install).toBeGreaterThanOrEqual(0)
+        expect(install).toBeLessThan(check)
+      }
+      const ripgrep = steps.findIndex(step => step.run?.includes('apt-get install -y ripgrep'))
+      expect(ripgrep).toBeGreaterThanOrEqual(0)
+      expect(ripgrep).toBeLessThan(check)
     }
   })
 
