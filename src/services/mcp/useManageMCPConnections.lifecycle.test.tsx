@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import React from 'react'
 import { render } from 'ink'
 import { PassThrough } from 'node:stream'
@@ -6,9 +6,9 @@ import type { AppState } from '../../state/AppState.js'
 import { getDefaultAppState } from '../../state/AppStateStore.js'
 import type { ConnectedMCPServer } from './types.js'
 
-const appStateModule = await import('../../state/AppState.js')
-const clientModule = await import('./client.js')
-const configModule = await import('./config.js')
+const appStateModule = { ...await import('../../state/AppState.js') }
+const clientModule = { ...await import('./client.js') }
+const configModule = { ...await import('./config.js') }
 
 let state: AppState
 let closeHandler: ((name: string, client: ConnectedMCPServer['client']) => void) | undefined
@@ -97,6 +97,12 @@ beforeEach(() => {
       clients: [connectedServer()],
     },
   }
+})
+
+afterAll(() => {
+  mock.module('../../state/AppState.js', () => appStateModule)
+  mock.module('./client.js', () => clientModule)
+  mock.module('./config.js', () => configModule)
 })
 
 afterEach(() => {

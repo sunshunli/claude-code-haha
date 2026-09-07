@@ -12,8 +12,8 @@ import { StructuredIO } from './structuredIO.js'
 const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY
 process.env.ANTHROPIC_API_KEY = 'test-key'
 
-const mcpClient = await import('../services/mcp/client.js')
-const mcpConfig = await import('../services/mcp/config.js')
+const mcpClient = { ...await import('../services/mcp/client.js') }
+const mcpConfig = { ...await import('../services/mcp/config.js') }
 
 let isDisabled = false
 let hasConfig = true
@@ -148,6 +148,8 @@ afterEach(() => {
 })
 
 afterAll(() => {
+  mock.module('../services/mcp/client.js', () => mcpClient)
+  mock.module('../services/mcp/config.js', () => mcpConfig)
   if (originalAnthropicApiKey === undefined) {
     delete process.env.ANTHROPIC_API_KEY
   } else {
