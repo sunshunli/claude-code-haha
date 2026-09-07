@@ -45,6 +45,83 @@ describe('proxy anthropic-compatible path', () => {
   beforeEach(setup)
   afterEach(teardown)
 
+  test.each([false, true])('forwards real HTTP requests to the upstream host (stream=%s)', async stream => {
+    const received: Array<{ url: string; headers: Headers; body: unknown }> = []
+    const responseBody = stream
+      ? 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      : JSON.stringify({ type: 'message', content: [{ type: 'text', text: 'ok' }] })
+    const upstream = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      async fetch(request) {
+        received.push({ url: request.url, headers: request.headers, body: await request.json() })
+        return new Response(responseBody, {
+          headers: { 'content-type': stream ? 'text/event-stream' : 'application/json' },
+        })
+      },
+    })
+    const proxy = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: request => handleProxyRequest(request, new URL(request.url)),
+    })
+
+    try {
+      const provider = await new ProviderService().addProvider({
+        presetId: 'custom',
+        name: 'Loopback Anthropic',
+        baseUrl: upstream.url.origin,
+        apiKey: 'test-upstream-key',
+        apiFormat: 'anthropic',
+        authStrategy: 'api_key',
+        supportsNestedToolResultMedia: false,
+        models: { main: 'fixture-model', haiku: '', sonnet: '', opus: '' },
+      })
+      const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'fixture' } }
+      const response = await fetch(new URL(`/proxy/providers/${provider.id}/v1/messages`, proxy.url), {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'fixture-beta',
+          'x-api-key': 'test-client-key',
+        },
+        body: JSON.stringify({
+          model: 'fixture-model',
+          max_tokens: 64,
+          stream,
+          messages: [
+            { role: 'assistant', content: [{ type: 'tool_use', id: 'call-image', name: 'Read', input: {} }] },
+            { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-image', content: [image] }] },
+          ],
+        }),
+        signal: AbortSignal.timeout(5_000),
+      })
+
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe(responseBody)
+      expect(received).toHaveLength(1)
+      expect(received[0]!.url).toBe(new URL('/v1/messages', upstream.url).href)
+      expect(received[0]!.headers.get('host')).toBe(upstream.url.host)
+      expect(received[0]!.headers.get('x-api-key')).toBe('test-upstream-key')
+      expect(received[0]!.headers.get('anthropic-version')).toBe('2023-06-01')
+      expect(received[0]!.headers.get('anthropic-beta')).toBe('fixture-beta')
+      expect(received[0]!.body).toMatchObject({
+        messages: [
+          { role: 'assistant' },
+          { role: 'user', content: [
+            { type: 'tool_result', tool_use_id: 'call-image' },
+            { type: 'text' },
+            image,
+          ] },
+        ],
+      })
+    } finally {
+      proxy.stop(true)
+      upstream.stop(true)
+    }
+  })
+
   test('hoists nested media, sends auth headers, and forwards protocol headers', async () => {
     const svc = new ProviderService()
     const provider = await svc.addProvider({

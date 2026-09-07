@@ -455,7 +455,8 @@ async function handleAnthropicCompatible(
   for (const [name, value] of incomingHeaders.entries()) {
     const lower = name.toLowerCase()
     if (deny.has(lower) || isInternalClientHeader(lower, value)) continue
-    if (lower === 'content-type' || lower === 'content-length') continue
+    // The local proxy's authority must not replace the upstream host.
+    if (lower === 'host' || lower === 'content-type' || lower === 'content-length') continue
     if (lower === 'x-api-key' || lower === 'authorization') continue
     if (value) headers[name] = value
   }

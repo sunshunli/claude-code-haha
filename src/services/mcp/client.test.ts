@@ -1,5 +1,6 @@
-import { describe, expect, test } from 'bun:test'
-import { transformMCPResult } from './client.js'
+import { describe, expect, spyOn, test } from 'bun:test'
+import * as tokenEstimation from '../tokenEstimation.js'
+import { processMCPResult, transformMCPResult } from './client.js'
 
 const ONE_PX_PNG =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
@@ -121,6 +122,53 @@ describe('transformMCPResult media handling', () => {
 })
 
 describe('persistTextFromImageContent', () => {
+  test('preserves the trailing image through oversized MCP result processing', async () => {
+    const fs = await import('fs/promises')
+    const os = await import('os')
+    const path = await import('path')
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-process-media-'))
+    const previous = {
+      configDir: process.env.CLAUDE_CONFIG_DIR,
+      maxTokens: process.env.MAX_MCP_OUTPUT_TOKENS,
+      largeOutputFiles: process.env.ENABLE_MCP_LARGE_OUTPUT_FILES,
+    }
+    process.env.CLAUDE_CONFIG_DIR = tmpDir
+    process.env.MAX_MCP_OUTPUT_TOKENS = '25000'
+    process.env.ENABLE_MCP_LARGE_OUTPUT_FILES = '1'
+    const countTokens = spyOn(tokenEstimation, 'countMessagesTokensWithAPI').mockResolvedValue(50000)
+    const fullText = 'log '.repeat(40000)
+
+    try {
+      const result = await processMCPResult({ content: [
+        { type: 'text', text: fullText },
+        { type: 'image', mimeType: 'image/png', data: ONE_PX_PNG },
+        { type: 'text', text: 'Screenshot caption' },
+      ] }, 'test-tool', 'test-server')
+      expect(countTokens).toHaveBeenCalled()
+      expect(Array.isArray(result)).toBe(true)
+      if (!Array.isArray(result)) throw new Error('Expected media content blocks')
+      expect(result.some(block => block.type === 'image')).toBe(true)
+      expect(result).toContainEqual({ type: 'text', text: 'Screenshot caption' })
+      const savedPath = result
+        .filter(block => block.type === 'text')
+        .map(block => block.text.match(/saved to (.+)/)?.[1])
+        .find(Boolean)
+      expect(savedPath).toBeDefined()
+      expect(await fs.readFile(savedPath!, 'utf8')).toBe(`${fullText}\nScreenshot caption`)
+    } finally {
+      countTokens.mockRestore()
+      for (const [key, value] of Object.entries({
+        CLAUDE_CONFIG_DIR: previous.configDir,
+        MAX_MCP_OUTPUT_TOKENS: previous.maxTokens,
+        ENABLE_MCP_LARGE_OUTPUT_FILES: previous.largeOutputFiles,
+      })) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await fs.rm(tmpDir, { recursive: true, force: true })
+    }
+  })
+
   test('keeps media blocks in order with bounded text summaries and persists full text', async () => {
     const fs = await import('fs/promises')
     const os = await import('os')
