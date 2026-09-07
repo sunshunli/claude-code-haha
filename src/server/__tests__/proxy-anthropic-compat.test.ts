@@ -5,7 +5,7 @@ import * as path from 'path'
 import { handleProxyRequest } from '../proxy/handler.js'
 import { ProviderService } from '../services/providerService.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
-import { clearTraceCaptureStateForTests, drainTraceCaptureForTests } from '../../services/api/traceCapture.js'
+import { clearTraceCaptureStateForTests, drainTraceCaptureForTests, type TraceCallRecord } from '../../services/api/traceCapture.js'
 
 let tmpDir: string
 let originalConfigDir: string | undefined
@@ -1634,6 +1634,110 @@ describe('proxy anthropic-compatible path', () => {
       const callIds = new Set(calls.map(call => call.id))
       expect(callIds.size).toBe(1)
       expect(calls[calls.length - 1]!.status).toBe('error')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test.each([
+    { name: 'connection exception', upstream: () => { throw new Error('gateway connection refused') }, message: 'gateway connection refused', stream: false },
+    { name: 'non-Error rejection', upstream: () => Promise.reject('gateway connection reset'), message: 'gateway connection reset', stream: true },
+    { name: 'successful SSE response without a body', upstream: () => new Response(null, { status: 200 }), message: 'Upstream returned no body for stream', stream: true },
+  ])('finishes exactly one failed trace for $name', async ({ upstream, message, stream }) => {
+    const provider = await new ProviderService().addProvider({
+      presetId: 'custom',
+      name: 'Anthropic failure fixture',
+      baseUrl: 'https://relay.example.com',
+      apiKey: 'fixture-api-key',
+      apiFormat: 'anthropic',
+      supportsNestedToolResultMedia: false,
+      models: { main: 'model-main', haiku: 'model-main', sonnet: 'model-main', opus: 'model-main' },
+    })
+    const sessionId = 'session-trace-upstream-failure'
+    const originalFetch = globalThis.fetch
+    const upstreamFetch = mock(async () => upstream())
+    globalThis.fetch = upstreamFetch as typeof fetch
+    try {
+      const request = new Request(`http://localhost:3456/proxy/providers/${provider.id}/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-claude-code-session-id': sessionId },
+        body: JSON.stringify({
+          model: 'model-main', max_tokens: 64, stream,
+          messages: [{ role: 'user', content: 'fixture prompt' }],
+        }),
+      })
+      const response = await handleProxyRequest(request, new URL(request.url))
+      expect(response.status).toBe(502)
+      expect(await response.json()).toEqual({ type: 'error', error: { type: 'api_error', message } })
+      expect(upstreamFetch).toHaveBeenCalledTimes(1)
+
+      await drainTraceCaptureForTests()
+      const raw = await fs.readFile(path.join(tmpDir, 'cc-haha', 'traces', `${sessionId}.jsonl`), 'utf8')
+      const calls = raw.trim().split('\n')
+        .map(line => JSON.parse(line) as { type: string; record: TraceCallRecord })
+        .filter(entry => entry.type === 'call')
+        .map(entry => entry.record)
+      expect(calls.map(call => call.status)).toEqual(['pending', 'error'])
+      expect(new Set(calls.map(call => call.id)).size).toBe(1)
+      expect(calls[1]!.error?.message).toBe(message)
+      expect(calls[1]!.request.url).toBe('https://relay.example.com/v1/messages')
+      expect(calls[1]!.completedAt).toBeTruthy()
+      expect(raw).not.toContain('fixture-api-key')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('preserves a compressed rate-limit response while recording its readable failed trace', async () => {
+    const provider = await new ProviderService().addProvider({
+      presetId: 'custom',
+      name: 'Anthropic rate-limit fixture',
+      baseUrl: 'https://relay.example.com',
+      apiKey: 'fixture-api-key',
+      apiFormat: 'anthropic',
+      supportsNestedToolResultMedia: false,
+      models: { main: 'model-main', haiku: 'model-main', sonnet: 'model-main', opus: 'model-main' },
+    })
+    const sessionId = 'session-trace-compressed-rate-limit'
+    const errorBody = JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'fixture upstream quota exhausted' } })
+    const compressedBody = Bun.deflateSync(Buffer.from(errorBody))
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mock(async () => new Response(compressedBody, {
+      status: 429,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Encoding': 'deflate',
+        'Content-Length': String(compressedBody.length),
+        'retry-after': '42',
+        'request-id': 'fixture-request-id',
+      },
+    })) as typeof fetch
+    try {
+      const request = new Request(`http://localhost:3456/proxy/providers/${provider.id}/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-claude-code-session-id': sessionId },
+        body: JSON.stringify({ model: 'model-main', max_tokens: 64, messages: [{ role: 'user', content: 'fixture prompt' }] }),
+      })
+      const response = await handleProxyRequest(request, new URL(request.url))
+      expect(response.status).toBe(429)
+      expect(response.headers.get('retry-after')).toBe('42')
+      expect(response.headers.get('request-id')).toBe('fixture-request-id')
+      expect(response.headers.get('content-encoding')).toBe('deflate')
+      expect(response.headers.get('content-length')).toBe(String(compressedBody.length))
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array(compressedBody))
+
+      await drainTraceCaptureForTests()
+      const raw = await fs.readFile(path.join(tmpDir, 'cc-haha', 'traces', `${sessionId}.jsonl`), 'utf8')
+      const calls = raw.trim().split('\n')
+        .map(line => JSON.parse(line) as { type: string; record: TraceCallRecord })
+        .filter(entry => entry.type === 'call')
+        .map(entry => entry.record)
+      expect(calls.map(call => call.status)).toEqual(['pending', 'error'])
+      expect(new Set(calls.map(call => call.id)).size).toBe(1)
+      expect(calls[1]!.response?.status).toBe(429)
+      expect(JSON.stringify(calls[1]!.response?.body)).toContain('fixture upstream quota exhausted')
+      expect(raw).not.toContain('trace body unavailable')
+      expect(raw).not.toContain('fixture-api-key')
     } finally {
       globalThis.fetch = originalFetch
     }
