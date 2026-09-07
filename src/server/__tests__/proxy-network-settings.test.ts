@@ -6,6 +6,7 @@ import { handleProxyRequest, withStreamIdleTimeout } from '../proxy/handler.js'
 import { ProviderService } from '../services/providerService.js'
 import {
   clearTraceCaptureStateForTests,
+  drainTraceCaptureForTests,
   traceCaptureService,
 } from '../services/traceCaptureService.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
@@ -28,6 +29,7 @@ async function teardown() {
     delete process.env.CLAUDE_CONFIG_DIR
   }
   resetSettingsCache()
+  await drainTraceCaptureForTests()
   clearTraceCaptureStateForTests()
   await fs.rm(tmpDir, { recursive: true, force: true })
 }
