@@ -79,6 +79,7 @@ describe('PR quality workflow', () => {
     for (const [job, command] of [
       ['server-checks', 'bun run check:server'],
       ['coverage-checks', 'bun run check:coverage'],
+      ['desktop-native-checks', 'bun run check:native'],
     ]) {
       const steps = jobs[job].steps ?? []
       const check = steps.findIndex(step => step.run === command)
@@ -90,7 +91,7 @@ describe('PR quality workflow', () => {
         expect(install).toBeGreaterThanOrEqual(0)
         expect(install).toBeLessThan(check)
       }
-      const ripgrep = steps.findIndex(step => step.run?.includes('apt-get install -y ripgrep'))
+      const ripgrep = steps.findIndex(step => step.run?.includes('apt-get install') && /\bripgrep\b/.test(step.run))
       expect(ripgrep).toBeGreaterThanOrEqual(0)
       expect(ripgrep).toBeLessThan(check)
     }
