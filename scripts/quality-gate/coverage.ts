@@ -452,11 +452,12 @@ export async function runCommand(command: string[], cwd: string, logPath: string
   const started = Date.now()
   const sandboxHome = mkdtempSync(join(tmpdir(), 'cc-haha-coverage-test-'))
   const header = `$ ${command.join(' ')}\n`
+  const capturePath = join(sandboxHome, 'coverage-output.log')
   let logFd: number | undefined
   try {
-    mkdirSync(dirname(logPath), { recursive: true })
-    logFd = openSync(logPath, 'w')
-    writeFileSync(logFd, header)
+    // Reporters such as Vitest delete their output directory on startup. Keep
+    // the live capture outside that directory until the process has finished.
+    logFd = openSync(capturePath, 'w')
     // Bun's synchronous text coverage reporter can fail while writing a large
     // report to a pipe, before it emits LCOV or its test-count summary. Give
     // both streams a regular file descriptor, with no pipe buffer to exhaust.
@@ -469,7 +470,9 @@ export async function runCommand(command: string[], cwd: string, logPath: string
     const exitCode = await proc.exited
     closeSync(logFd)
     logFd = undefined
-    const output = readFileSync(logPath, 'utf8').slice(header.length)
+    const output = readFileSync(capturePath, 'utf8')
+    mkdirSync(dirname(logPath), { recursive: true })
+    writeFileSync(logPath, `${header}${output}`)
     return {
       exitCode,
       durationMs: Date.now() - started,

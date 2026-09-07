@@ -407,6 +407,31 @@ describe('coverage gate helpers', () => {
 })
 
 describe('coverage subprocess output', () => {
+  test('preserves output when the reporter replaces its destination directory', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cc-haha-coverage-cleanup-'))
+    const script = join(root, 'reporter.ts')
+    const logPath = join(root, 'reports', 'coverage.log')
+    try {
+      writeFileSync(script, `
+        import { mkdirSync, rmSync, writeFileSync, writeSync } from 'node:fs'
+        writeSync(1, 'before report cleanup\\n')
+        // Vitest removes reportsDirectory before emitting its coverage files.
+        rmSync('reports', { recursive: true, force: true })
+        mkdirSync('reports')
+        writeFileSync('reports/lcov.info', 'SF:src/example.ts\\nDA:1,1\\nLF:1\\nLH:1\\nend_of_record\\n')
+        writeSync(2, 'after report cleanup\\n')
+      `)
+      const command = [process.execPath, '--no-env-file', script]
+      const result = await runCommand(command, root, logPath)
+      expect(result.exitCode).toBe(0)
+      expect(result.output).toBe('before report cleanup\nafter report cleanup\n')
+      expect(readFileSync(logPath, 'utf8')).toBe(`$ ${command.join(' ')}\n${result.output}`)
+      expect(hasUsableLcov(readFileSync(join(root, 'reports', 'lcov.info'), 'utf8'))).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   test('captures large synchronous reports to regular files without losing artifacts or exit status', async () => {
     const root = mkdtempSync(join(tmpdir(), 'cc-haha-coverage-output-'))
     const script = join(root, 'reporter.ts')
