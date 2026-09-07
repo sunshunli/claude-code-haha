@@ -4,7 +4,7 @@ import { parse } from 'yaml'
 
 type WorkflowJob = {
   needs?: string | string[]
-  steps?: Array<{ name?: string; run?: string }>
+  steps?: Array<{ name?: string; run?: string; 'working-directory'?: string }>
 }
 
 function workflowJobs(workflow: string) {
@@ -68,6 +68,17 @@ describe('PR quality workflow', () => {
     ]) {
       expect(jobs[jobId].needs).toBe('scope-plan')
     }
+  })
+
+  test('installs adapter dependencies before root server tests that import adapters', () => {
+    const jobs = workflowJobs(readFileSync('.github/workflows/pr-quality.yml', 'utf8'))
+    const steps = jobs['server-checks'].steps ?? []
+    const adapterInstall = steps.findIndex(step =>
+      step['working-directory'] === 'adapters' && step.run === 'bun install --frozen-lockfile',
+    )
+    const serverCheck = steps.findIndex(step => step.run === 'bun run check:server')
+    expect(adapterInstall).toBeGreaterThanOrEqual(0)
+    expect(adapterInstall).toBeLessThan(serverCheck)
   })
 
   test('keeps coverage artifacts observable in CI', () => {
