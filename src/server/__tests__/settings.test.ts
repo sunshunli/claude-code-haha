@@ -13,6 +13,7 @@ import { handleModelsApi } from '../api/models.js'
 import { handleStatusApi, resetUsage, addUsage } from '../api/status.js'
 import { ProviderService } from '../services/providerService.js'
 import { hahaOAuthService } from '../services/hahaOAuthService.js'
+import { hahaOpenAIOAuthService } from '../services/hahaOpenAIOAuthService.js'
 import {
   clearOpenAICodexModelCatalogCache,
 } from '../../services/openaiAuth/modelCatalog.js'
@@ -1160,6 +1161,55 @@ describe('Models API', () => {
       defaultReasoningEffort: 'low',
       supportedReasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
     })
+  })
+
+  it('GET /api/models discovers models using the desktop ChatGPT account', async () => {
+    const providerSvc = new ProviderService()
+    await providerSvc.activateProvider('openai-official')
+    await hahaOpenAIOAuthService.saveTokens({
+      accessToken: 'desktop-catalog-token',
+      refreshToken: null,
+      expiresAt: null,
+      accountId: 'desktop-account',
+      email: 'desktop@example.test',
+    })
+    const originalFetch = globalThis.fetch
+    const requests: Headers[] = []
+    clearOpenAICodexModelCatalogCache()
+    globalThis.fetch = (async (_input, init) => {
+      requests.push(new Headers(init?.headers))
+      return Response.json({ models: [{
+        slug: 'gpt-desktop-account-only',
+        display_name: 'Desktop account model',
+        visibility: 'list',
+        default_reasoning_level: 'high',
+        supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }],
+        context_window: 300_000,
+      }] })
+    }) as typeof fetch
+    try {
+      const { req, url, segments } = makeRequest('GET', '/api/models')
+      expect((await handleModelsApi(req, url, segments)).status).toBe(200)
+      // Let the immediate background catalog response settle before reading it.
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const res = await handleModelsApi(req, url, segments)
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.models).toEqual([{
+        id: 'gpt-desktop-account-only',
+        name: 'Desktop account model',
+        description: '',
+        context: '285000',
+        defaultReasoningEffort: 'high',
+        supportedReasoningEfforts: ['low', 'high'],
+      }])
+      expect(requests).toHaveLength(1)
+      expect(requests[0]?.get('Authorization')).toBe('Bearer desktop-catalog-token')
+      expect(requests[0]?.get('ChatGPT-Account-Id')).toBe('desktop-account')
+    } finally {
+      globalThis.fetch = originalFetch
+      clearOpenAICodexModelCatalogCache()
+    }
   })
 
   it('PUT /api/models/current should persist GPT model to managed settings when ChatGPT Official is active', async () => {
