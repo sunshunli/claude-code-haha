@@ -4983,7 +4983,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         break
       }
 
-      case 'error':
+      case 'error': {
+        const errorMessage: Extract<UIMessage, { type: 'error' }> = {
+          id: nextId(),
+          type: 'error',
+          message: msg.message,
+          code: msg.code,
+          ...(msg.businessErrorCode ? { businessErrorCode: msg.businessErrorCode } : {}),
+          timestamp: Date.now(),
+        }
+        if (msg.code === 'RUNTIME_CONFIG_INVALID') {
+          // Validation rejects the selection before changing the runtime. It
+          // neither ends the active turn nor invalidates an in-flight history load.
+          update((s) => ({ messages: [...s.messages, errorMessage] }))
+          break
+        }
         update((s) => {
           const pendingText = `${s.streamingText}${consumePendingDelta(sessionId)}`
           let newMessages = s.messages
@@ -4991,17 +5005,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             newMessages = appendAssistantTextMessage(newMessages, pendingText, Date.now())
           }
           newMessages = dropTailCompactingCompactSummary(newMessages)
-          newMessages = [
-            ...newMessages,
-            {
-              id: nextId(),
-              type: 'error',
-              message: msg.message,
-              code: msg.code,
-              ...(msg.businessErrorCode ? { businessErrorCode: msg.businessErrorCode } : {}),
-              timestamp: Date.now(),
-            },
-          ]
+          newMessages = [...newMessages, errorMessage]
           return {
             messages: newMessages,
             chatState: 'idle',
@@ -5027,6 +5031,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           }
         }
         break
+      }
 
       case 'background_task_stop_failed':
         update((session) => {

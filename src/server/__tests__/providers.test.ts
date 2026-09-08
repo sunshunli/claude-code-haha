@@ -11,6 +11,7 @@ import { handleProvidersApi } from '../api/providers.js'
 import { handleProxyRequest } from '../proxy/handler.js'
 import {
   clearTraceCaptureStateForTests,
+  drainTraceCaptureForTests,
   setTraceAppendBeforeWriteHookForTests,
   traceCaptureService,
 } from '../services/traceCaptureService.js'
@@ -32,6 +33,7 @@ async function setup() {
 }
 
 async function teardown() {
+  await drainTraceCaptureForTests()
   clearTraceCaptureStateForTests()
   if (originalConfigDir !== undefined) {
     process.env.CLAUDE_CONFIG_DIR = originalConfigDir
@@ -42,6 +44,17 @@ async function teardown() {
     process.env.HOME = originalHome
   } else {
     delete process.env.HOME
+  }
+  // The background trace projection may still hold a handle briefly (first
+  // index builds are slower); retry the removal instead of failing the test
+  // on Windows.
+  for (let attempt = 0; attempt < 60; attempt++) {
+    try {
+      await fs.rm(tmpDir, { recursive: true, force: true })
+      return
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
   }
   await fs.rm(tmpDir, { recursive: true, force: true })
 }
@@ -838,6 +851,34 @@ describe('ProviderService', () => {
       expect(env.ANTHROPIC_MODEL).toBe('model-main')
     })
 
+    test('editing an existing provider persists supportsNestedToolResultMedia and reroutes it through the proxy', async () => {
+      const svc = new ProviderService()
+      const added = await svc.addProvider(sampleInput())
+      await svc.activateProvider(added.id)
+
+      // Default: nested media preserved, direct connection.
+      let settings = await readSettings()
+      let env = settings.env as Record<string, string>
+      expect(env.ANTHROPIC_BASE_URL).toBe('https://api.example.com')
+
+      const updated = await svc.updateProvider(added.id, { supportsNestedToolResultMedia: false })
+
+      expect(updated.supportsNestedToolResultMedia).toBe(false)
+
+      settings = await readSettings()
+      env = settings.env as Record<string, string>
+      expect(env.ANTHROPIC_BASE_URL).toContain('127.0.0.1')
+      expect(env.ANTHROPIC_API_KEY).toBe('proxy-managed')
+
+      // Editing back to nested media restores the direct connection.
+      const reverted = await svc.updateProvider(added.id, { supportsNestedToolResultMedia: true })
+      expect(reverted.supportsNestedToolResultMedia).toBe(true)
+
+      settings = await readSettings()
+      env = settings.env as Record<string, string>
+      expect(env.ANTHROPIC_BASE_URL).toBe('https://api.example.com')
+    })
+
     test('updating active provider should override and clear auto compact window', async () => {
       const svc = new ProviderService()
       const added = await svc.addProvider(sampleInput({ autoCompactWindow: 64000 }))
@@ -1287,6 +1328,50 @@ describe('ProviderService', () => {
       }
     })
 
+    test.each([
+      ['xuanshuapi', 'https://www.xuanshuapi.com', 'claude-sonnet-5'],
+      ['fennoai', 'https://api.fenno.ai', 'claude-sonnet-5'],
+      ['qiniuai', 'https://api.qnaigc.com', 'deepseek/deepseek-v4-pro'],
+    ])('keeps legacy %s providers editable and usable after retirement', async (presetId, baseUrl, model) => {
+      // This is an old on-disk record: auth/context fields were not always persisted.
+      const legacyProvider = {
+        id: `saved-${presetId}`,
+        ...sampleInput({ presetId, baseUrl, models: { main: model, haiku: model, sonnet: model, opus: model } }),
+      }
+      await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+      await fs.writeFile(path.join(tmpDir, 'cc-haha', 'providers.json'), JSON.stringify({
+        providers: [legacyProvider],
+        activeId: legacyProvider.id,
+      }))
+
+      const svc = new ProviderService()
+      expect((await svc.listProviders()).providers).toEqual([expect.objectContaining(legacyProvider)])
+
+      await svc.updateProvider(legacyProvider.id, { name: 'Renamed saved provider' })
+      await svc.activateProvider(legacyProvider.id)
+      const restarted = new ProviderService()
+      expect(await restarted.getProvider(legacyProvider.id)).toMatchObject({
+        ...legacyProvider,
+        name: 'Renamed saved provider',
+      })
+      expect((await restarted.listProviders()).activeId).toBe(legacyProvider.id)
+
+      const runtimeEnv = await restarted.getProviderRuntimeEnv(legacyProvider.id)
+      const settingsEnv = (await readSettings()).env as Record<string, string>
+      for (const env of [runtimeEnv, settingsEnv]) {
+        expect(env).toMatchObject({
+          ANTHROPIC_BASE_URL: baseUrl,
+          ANTHROPIC_AUTH_TOKEN: legacyProvider.apiKey,
+          ANTHROPIC_API_KEY: '',
+          ANTHROPIC_MODEL: model,
+        })
+        expect(JSON.parse(env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)[model]).toBe(1000000)
+        if (presetId === 'xuanshuapi') {
+          expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('claude-sonnet-5')
+        }
+      }
+    })
+
     test('should include preset default env on activation and runtime env', async () => {
       const svc = new ProviderService()
       const provider = await svc.addProvider(sampleInput({
@@ -1481,6 +1566,21 @@ describe('ProviderService', () => {
       expect(active!.baseUrl).toBe(provider.baseUrl)
       expect(active!.apiKey).toBe(provider.apiKey)
       expect(active!.apiFormat).toBe('anthropic')
+    })
+
+    test('should resolve preset default auth for a no-key proxy provider', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        presetId: 'lmstudio',
+        apiKey: '',
+        apiFormat: 'anthropic',
+        supportsNestedToolResultMedia: false,
+      }))
+
+      const config = await svc.getProviderForProxy(provider.id)
+
+      expect(config?.apiKey).toBe('lmstudio')
+      expect(config?.authStrategy).toBe('auth_token_empty_api_key')
     })
 
     test('should return null when ChatGPT Official is the active provider', async () => {
@@ -2018,15 +2118,20 @@ describe('ProviderService', () => {
       })
 
       const messages = body.messages as Array<Record<string, unknown>>
-      expect(messages[0]).toEqual({
-        role: 'tool',
-        tool_call_id: 'computer_1',
-        content: [
-          { type: 'text', text: 'Computer Use state' },
-          { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,/9j/AA==' } },
-          { type: 'text', text: 'After screenshot' },
-        ],
-      })
+      expect(messages).toEqual([
+        {
+          role: 'tool',
+          tool_call_id: 'computer_1',
+          content: 'Computer Use stateAfter screenshot',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '[Media content for tool call computer_1]' },
+            { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,/9j/AA==' } },
+          ],
+        },
+      ])
     })
 
     test.each([
@@ -2054,7 +2159,7 @@ describe('ProviderService', () => {
       expect(messages[0]).toEqual({
         role: 'tool',
         tool_call_id: 'computer_1',
-        content: '[Image omitted: this OpenAI-compatible chat endpoint only supports text content.]',
+        content: '\n[Image omitted: this OpenAI-compatible chat endpoint only supports text content.]\n',
       })
       expect(JSON.stringify(body)).not.toContain('private-screenshot-data')
       expect(JSON.stringify(body)).not.toContain('image_url')
@@ -2071,14 +2176,20 @@ describe('ProviderService', () => {
       })
 
       const messages = body.messages as Array<Record<string, unknown>>
-      expect(messages[0]).toEqual({
-        role: 'tool',
-        tool_call_id: 'computer_1',
-        content: [{
-          type: 'image_url',
-          image_url: { url: 'data:image/png;base64,generic-image-data' },
-        }],
-      })
+      expect(messages).toEqual([
+        {
+          role: 'tool',
+          tool_call_id: 'computer_1',
+          content: 'Media result attached after this tool result.',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '[Media content for tool call computer_1]' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,generic-image-data' } },
+          ],
+        },
+      ])
     })
 
     test('normalizes context-window suffixes before forwarding OpenAI Chat proxy requests', async () => {
@@ -2321,6 +2432,40 @@ describe('ProviderService', () => {
         expect(calls[1].headers.Authorization).toBeUndefined()
         expect(calls[2].headers['x-api-key']).toBe('sk-dual')
         expect(calls[2].headers.Authorization).toBe('Bearer sk-dual')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('tests the proxy path for Anthropic providers that require media hoisting', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: Array<{ body: Record<string, unknown> }> = []
+      globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ body: JSON.parse(String(init?.body)) as Record<string, unknown> })
+        return new Response(JSON.stringify({
+          type: 'message',
+          model: 'model-main',
+          content: [{ type: 'text', text: 'ok' }],
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const result = await svc.testProviderConfig({
+          baseUrl: 'https://api.example.com/anthropic',
+          apiKey: 'sk-api',
+          modelId: 'model-main',
+          authStrategy: 'api_key',
+          apiFormat: 'anthropic',
+          supportsNestedToolResultMedia: false,
+        })
+
+        expect(result.connectivity.success).toBe(true)
+        expect(result.proxy?.success).toBe(true)
+        expect(calls).toHaveLength(2)
       } finally {
         globalThis.fetch = originalFetch
       }

@@ -495,6 +495,114 @@ describe('chatStore history mapping', () => {
     })
   })
 
+  it.each(['before', 'during', 'after'] as const)(
+    'restores an existing transcript when runtime selection fails %s history loading',
+    async (errorTiming) => {
+      let resolveHistory!: (value: { messages: MessageEntry[] }) => void
+      vi.mocked(sessionsApi.getMessages).mockReturnValueOnce(new Promise((resolve) => {
+        resolveHistory = resolve
+      }))
+      useChatStore.setState({
+        sessions: {
+          [TEST_SESSION_ID]: makeSession({ chatState: 'idle' }),
+        },
+      })
+      const runtimeError: ServerMessage = {
+        type: 'error',
+        message: 'Runtime effort selection is invalid.',
+        code: 'RUNTIME_CONFIG_INVALID',
+      }
+      if (errorTiming === 'before') {
+        useChatStore.getState().handleServerMessage(TEST_SESSION_ID, runtimeError)
+      }
+      const historyLoad = useChatStore.getState().loadHistory(TEST_SESSION_ID)
+      if (errorTiming === 'during') {
+        useChatStore.getState().handleServerMessage(TEST_SESSION_ID, runtimeError)
+      }
+      resolveHistory({
+        messages: [
+          {
+            id: 'old-user',
+            type: 'user',
+            timestamp: '2026-07-01T00:00:00.000Z',
+            content: [{ type: 'text', text: 'Previously saved question' }],
+          },
+          {
+            id: 'old-assistant',
+            type: 'assistant',
+            timestamp: '2026-07-01T00:00:01.000Z',
+            content: [{ type: 'text', text: 'Previously saved answer' }],
+          },
+        ],
+      })
+      await historyLoad
+      if (errorTiming === 'after') {
+        useChatStore.getState().handleServerMessage(TEST_SESSION_ID, runtimeError)
+      }
+
+      const session = useChatStore.getState().sessions[TEST_SESSION_ID]
+      expect(session?.messages).toEqual([
+        expect.objectContaining({ type: 'user_text', content: 'Previously saved question' }),
+        expect.objectContaining({ type: 'assistant_text', content: 'Previously saved answer' }),
+        expect.objectContaining({ type: 'error', code: 'RUNTIME_CONFIG_INVALID' }),
+      ])
+      expect(session?.historyStatus).toBe('ready')
+    },
+  )
+
+  it.each(['streaming', 'permission_pending'] as const)(
+    'keeps the active %s turn intact when runtime selection is rejected',
+    (chatState) => {
+      const elapsedTimer = setInterval(() => {}, 1_000)
+      try {
+        useChatStore.setState({
+          sessions: {
+            [TEST_SESSION_ID]: makeSession({
+              chatState: 'streaming',
+              streamingText: 'Unfinished reply',
+              activeThinkingId: 'thinking-current',
+              elapsedTimer,
+              historyMutationEpoch: 3,
+            }),
+          },
+        })
+        if (chatState === 'permission_pending') {
+          useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+            type: 'permission_request',
+            requestId: 'permission-current',
+            toolName: 'Read',
+            toolUseId: 'tool-current',
+            input: { file_path: '/fixture/outside.txt' },
+          })
+        }
+        const before = useChatStore.getState().sessions[TEST_SESSION_ID]!
+        updateTabStatusMock.mockClear()
+
+        useChatStore.getState().handleServerMessage(TEST_SESSION_ID, {
+          type: 'error',
+          message: 'Runtime effort selection is invalid.',
+          code: 'RUNTIME_CONFIG_INVALID',
+        })
+
+        const after = useChatStore.getState().sessions[TEST_SESSION_ID]!
+        expect(after.chatState).toBe(chatState)
+        expect(after.streamingText).toBe(before.streamingText)
+        expect(after.activeThinkingId).toBe(before.activeThinkingId)
+        expect(after.pendingPermission).toEqual(before.pendingPermission)
+        expect(after.pendingPermissions).toEqual(before.pendingPermissions)
+        expect(after.elapsedTimer).toBe(elapsedTimer)
+        expect(after.historyMutationEpoch).toBe(before.historyMutationEpoch)
+        expect(after.messages).toEqual([
+          ...before.messages,
+          expect.objectContaining({ type: 'error', code: 'RUNTIME_CONFIG_INVALID' }),
+        ])
+        expect(updateTabStatusMock).not.toHaveBeenCalledWith(TEST_SESSION_ID, 'error')
+      } finally {
+        clearInterval(elapsedTimer)
+      }
+    },
+  )
+
   it('does not prewarm an existing transcript when opening it for history review', () => {
     sessionStoreSnapshot.sessions = [{
       id: TEST_SESSION_ID,
