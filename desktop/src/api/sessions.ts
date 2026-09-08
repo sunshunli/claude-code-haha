@@ -10,6 +10,17 @@ export type SessionsResponse = {
   total: number
   index?: LocalIndexStatus
 }
+export type ProjectSessionHistoryParams = {
+  projectRoot: string
+  limit?: number
+  cursor?: string
+  beforeModifiedAt?: string
+  beforeId?: string
+}
+export type ProjectSessionHistoryResponse = {
+  sessions: SessionListItem[]
+  nextCursor: string | null
+}
 export type PetSessionRuntimeStatus = 'waiting' | 'failed' | 'review' | 'running' | 'idle'
 export type SessionChatStatusResponse = {
   state: 'idle' | 'thinking' | 'compacting' | 'tool_executing'
@@ -380,6 +391,15 @@ export const sessionsApi = {
     if (params?.offset) query.set('offset', String(params.offset))
     const qs = query.toString()
     return api.get<SessionsResponse>(`/api/sessions${qs ? `?${qs}` : ''}`, options)
+  },
+
+  listProjectHistory(params: ProjectSessionHistoryParams, options?: ApiRequestOptions) {
+    const query = new URLSearchParams({ projectRoot: params.projectRoot })
+    if (params.limit !== undefined) query.set('limit', String(params.limit))
+    if (params.cursor) query.set('cursor', params.cursor)
+    if (params.beforeModifiedAt) query.set('beforeModifiedAt', params.beforeModifiedAt)
+    if (params.beforeId) query.set('beforeId', params.beforeId)
+    return api.get<ProjectSessionHistoryResponse>(`/api/sessions/project-history?${query.toString()}`, options)
   },
 
   getMessages(sessionId: string) {

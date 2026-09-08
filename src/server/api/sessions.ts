@@ -5,6 +5,7 @@
  *
  * Routes:
  *   GET    /api/sessions            — 列出会话
+ *   GET    /api/sessions/project-history — 按逻辑项目分批浏览历史会话
  *   GET    /api/sessions/:id        — 获取会话详情
  *   GET    /api/sessions/:id/summary — 获取不含消息的会话元数据
  *   GET    /api/sessions/:id/messages — 获取会话消息
@@ -112,6 +113,21 @@ export async function handleSessionsApi(
     // Special collection route: /api/sessions/recent-projects
     if (sessionId === 'recent-projects' && req.method === 'GET') {
       return await getRecentProjects(url)
+    }
+
+    if (sessionId === 'project-history') {
+      if (req.method !== 'GET') return Response.json(
+        { error: 'METHOD_NOT_ALLOWED', message: `Method ${req.method} not allowed` }, { status: 405 },
+      )
+      const limit = url.searchParams.get('limit')
+      if (limit !== null && !/^\d+$/.test(limit)) throw ApiError.badRequest('Invalid limit parameter')
+      return Response.json(await sessionService.listProjectHistory({
+        projectRoot: url.searchParams.get('projectRoot') ?? '',
+        ...(limit !== null ? { limit: Number(limit) } : {}),
+        ...(url.searchParams.has('cursor') ? { cursor: url.searchParams.get('cursor')! } : {}),
+        ...(url.searchParams.has('beforeModifiedAt') ? { beforeModifiedAt: url.searchParams.get('beforeModifiedAt')! } : {}),
+        ...(url.searchParams.has('beforeId') ? { beforeId: url.searchParams.get('beforeId')! } : {}),
+      }))
     }
 
     // Special collection route: /api/sessions/repository-context

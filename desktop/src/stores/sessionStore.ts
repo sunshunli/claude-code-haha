@@ -4,7 +4,10 @@ import {
   type BatchDeleteSessionsResponse,
   type BranchSessionResponse,
   type CreateSessionRepositoryOptions,
+  type ProjectSessionHistoryParams,
+  type ProjectSessionHistoryResponse,
 } from '../api/sessions'
+import { ApiError } from '../api/client'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
 import { useSettingsStore } from './settingsStore'
 import { useTabStore } from './tabStore'
@@ -14,6 +17,19 @@ import { isPlaceholderSessionTitle } from '../lib/sessionTitle'
 import { invalidateRecentProjectsCache } from '../lib/recentProjectsCache'
 
 const SESSION_LIST_LIMIT = 400
+const PROJECT_HISTORY_PAGE_SIZE = 50
+
+export type ProjectHistoryState = {
+  isLoading: boolean
+  error: string | null
+  initialized: boolean
+  hasMore: boolean
+  nextCursor: string | null
+  sessionIds: Set<string>
+  excludedSessionIds?: Set<string>
+  requestId: number
+}
+type RecentProjectBoundary = { beforeModifiedAt: string; beforeId: string }
 
 type CreateSessionOptions = {
   repository?: CreateSessionRepositoryOptions
@@ -32,8 +48,13 @@ type SessionStore = {
   isBatchMode: boolean
   selectedSessionIds: Set<string>
   historicalSessionIds: Set<string>
+  recentSessionIds: Set<string>
+  recentProjectBoundaries: Record<string, RecentProjectBoundary>
+  projectHistory: Record<string, ProjectHistoryState>
 
   fetchSessions: (project?: string) => Promise<void>
+  loadMoreProjectSessions: (projectRoot: string) => Promise<void>
+  releaseProjectHistory: (projectRoot: string) => void
   hydrateHistoricalSessions: (sessions: SessionListItem[]) => SessionListItem[]
   openHistoricalSession: (session: SessionListItem) => void
   createSession: (workDir?: string, options?: CreateSessionOptions) => Promise<string>
@@ -58,6 +79,12 @@ type SessionStore = {
 }
 
 let fetchSessionsRequestId = 0
+let projectHistoryRequestId = 0
+const projectHistoryRequests = new Map<string, {
+  controller: AbortController
+  requestId: number
+  excludedSessionIds: Set<string>
+}>()
 // The local index can lag the create response by one refresh. Keep explicit
 // ids from that response until the list has observed them at least once.
 const pendingCreatedSessionIds = new Set<string>()
@@ -72,6 +99,9 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   isBatchMode: false,
   selectedSessionIds: new Set(),
   historicalSessionIds: new Set(),
+  recentSessionIds: new Set(),
+  recentProjectBoundaries: {},
+  projectHistory: {},
 
   fetchSessions: async (project?: string) => {
     const requestId = ++fetchSessionsRequestId
@@ -85,21 +115,19 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       let syncedSessions: SessionListItem[] = []
       set((state) => {
         if (requestId !== state.sessionListRequestId) return state
-        const openSessionIds = new Set(useTabStore.getState().tabs
-          .flatMap((tab) => tab.type === 'session'
-            ? [tab.sessionId]
-            : tab.type === 'trace' && tab.traceSessionId ? [tab.traceSessionId] : []))
+        const openSessionIds = getOpenSessionIds()
+        const projectSessionIds = getProjectHistorySessionIds(state.projectHistory)
         const historicalSessionIds = new Set([...state.historicalSessionIds]
           .filter((id) => openSessionIds.has(id)))
         // Only explicitly opened history needs metadata outside the recent
         // page. Closing its tab releases it even while the index is building.
         const retainedSessions = state.sessions.filter((session) => (
-          !state.historicalSessionIds.has(session.id) || historicalSessionIds.has(session.id)
+          !state.historicalSessionIds.has(session.id) || historicalSessionIds.has(session.id) || projectSessionIds.has(session.id)
         ))
         const incomingSessions = reconcilePendingCreatedSessions(raw, retainedSessions)
         const incomingIds = new Set(incomingSessions.map((session) => session.id))
         const retainedHistory = retainedSessions.filter((session) => (
-          historicalSessionIds.has(session.id) && !incomingIds.has(session.id)
+          (historicalSessionIds.has(session.id) || projectSessionIds.has(session.id)) && !incomingIds.has(session.id)
         ))
         const sessions = mergeSessionList(
           shouldRetainRenderedSessions(indexStatus)
@@ -111,6 +139,11 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
         return {
           sessions,
           historicalSessionIds,
+          recentSessionIds: new Set([
+            ...(shouldRetainRenderedSessions(indexStatus) ? state.recentSessionIds : []),
+            ...raw.map((session) => session.id),
+          ]),
+          recentProjectBoundaries: shouldRetainRenderedSessions(indexStatus) ? {} : buildRecentProjectBoundaries(raw),
           indexStatus,
           isLoading: indexStatus?.state === 'building' && sessions.length === 0,
         }
@@ -120,6 +153,117 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       if (requestId !== get().sessionListRequestId) return
       set({ error: (err as Error).message, isLoading: false })
     }
+  },
+
+  loadMoreProjectSessions: async (projectRoot) => {
+    if (!projectRoot) return
+    const previous = get().projectHistory[projectRoot]
+    if (previous?.isLoading || (previous?.initialized && !previous.hasMore)) return
+    const requestId = ++projectHistoryRequestId
+    const controller = new AbortController()
+    const request = { controller, requestId, excludedSessionIds: new Set(previous?.excludedSessionIds) }
+    projectHistoryRequests.set(projectRoot, request)
+    set((state) => ({
+      projectHistory: {
+        ...state.projectHistory,
+        [projectRoot]: {
+          initialized: false,
+          hasMore: true,
+          nextCursor: null,
+          sessionIds: new Set(),
+          ...state.projectHistory[projectRoot],
+          isLoading: true,
+          error: null,
+          requestId,
+        },
+      },
+    }))
+    const isCurrent = () => !controller.signal.aborted &&
+      get().projectHistory[projectRoot]?.requestId === requestId
+    const cursor = previous?.nextCursor
+    try {
+      let response: ProjectSessionHistoryResponse
+      try {
+        response = await sessionsApi.listProjectHistory(
+          cursor
+            ? { projectRoot, limit: PROJECT_HISTORY_PAGE_SIZE, cursor }
+            : initialProjectHistoryParams(projectRoot, get()),
+          { signal: controller.signal },
+        )
+      } catch (error) {
+        if (!isCurrent()) return
+        if (!cursor || !(error instanceof ApiError) || error.status !== 409) throw error
+        // Snapshot cursors can expire. Restart once, keeping visible rows and
+        // discarding the expired cursor even if the replacement request fails.
+        set((state) => ({
+          projectHistory: {
+            ...state.projectHistory,
+            [projectRoot]: { ...state.projectHistory[projectRoot]!, nextCursor: null, initialized: false, hasMore: true },
+          },
+        }))
+        response = await sessionsApi.listProjectHistory(initialProjectHistoryParams(projectRoot, get()), { signal: controller.signal })
+      }
+      if (!isCurrent()) return
+      const incoming = reconcileSessionSnapshots(
+        response.sessions.filter((session) => !request.excludedSessionIds.has(session.id)),
+        get().sessions,
+      )
+      set((state) => {
+        const history = state.projectHistory[projectRoot]
+        if (history?.requestId !== requestId) return state
+        return {
+          sessions: mergeSessionList([...incoming, ...state.sessions], state.sessions),
+          projectHistory: {
+            ...state.projectHistory,
+            [projectRoot]: {
+              ...history,
+              sessionIds: new Set([...history.sessionIds, ...incoming.map((session) => session.id)]),
+              nextCursor: response.nextCursor,
+              hasMore: response.nextCursor !== null,
+              initialized: true,
+              isLoading: false,
+              error: null,
+            },
+          },
+        }
+      })
+      syncOpenSessionTabTitles(incoming)
+    } catch (error) {
+      if (!isCurrent()) return
+      set((state) => ({
+        projectHistory: {
+          ...state.projectHistory,
+          [projectRoot]: { ...state.projectHistory[projectRoot]!, isLoading: false, error: error instanceof Error ? error.message : String(error) },
+        },
+      }))
+    } finally {
+      if (projectHistoryRequests.get(projectRoot) === request) projectHistoryRequests.delete(projectRoot)
+    }
+  },
+
+  releaseProjectHistory: (projectRoot) => {
+    projectHistoryRequests.get(projectRoot)?.controller.abort()
+    projectHistoryRequests.delete(projectRoot)
+    set((state) => {
+      const history = state.projectHistory[projectRoot]
+      if (!history) return state
+      const { [projectRoot]: _released, ...projectHistory } = state.projectHistory
+      const openSessionIds = getOpenSessionIds()
+      const historicalSessionIds = new Set([
+        ...state.historicalSessionIds,
+        ...[...history.sessionIds].filter((id) => openSessionIds.has(id)),
+      ])
+      const remainingProjectIds = getProjectHistorySessionIds(projectHistory)
+      return {
+        projectHistory,
+        historicalSessionIds,
+        sessions: state.sessions.filter((session) => (
+          !history.sessionIds.has(session.id) || state.recentSessionIds.has(session.id) ||
+          remainingProjectIds.has(session.id) || historicalSessionIds.has(session.id) ||
+          pendingCreatedSessionIds.has(session.id)
+        )),
+      }
+    })
   },
 
   hydrateHistoricalSessions: (snapshots) => {
@@ -224,9 +368,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     pendingCreatedSessionIds.delete(id)
     invalidateRecentProjectsCache()
     useSessionRuntimeStore.getState().clearSelection(id)
+    excludeDeletedProjectSessions([id])
     set((s) => ({
       sessions: s.sessions.filter((session) => session.id !== id),
       historicalSessionIds: removeIdsFromSet(s.historicalSessionIds, [id]),
+      recentSessionIds: removeIdsFromSet(s.recentSessionIds, [id]),
+      projectHistory: removeProjectHistorySessionIds(s.projectHistory, [id]),
       activeSessionId: s.activeSessionId === id ? null : s.activeSessionId,
       selectedSessionIds: removeIdsFromSet(s.selectedSessionIds, [id]),
       sessionListRequestId: ++fetchSessionsRequestId,
@@ -244,9 +391,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       pendingCreatedSessionIds.delete(id)
       useSessionRuntimeStore.getState().clearSelection(id)
     }
+    excludeDeletedProjectSessions(result.successes)
     set((s) => ({
       sessions: s.sessions.filter((session) => !result.successes.includes(session.id)),
       historicalSessionIds: removeIdsFromSet(s.historicalSessionIds, result.successes),
+      recentSessionIds: removeIdsFromSet(s.recentSessionIds, result.successes),
+      projectHistory: removeProjectHistorySessionIds(s.projectHistory, result.successes),
       activeSessionId: s.activeSessionId && result.successes.includes(s.activeSessionId)
         ? null
         : s.activeSessionId,
@@ -320,6 +470,65 @@ function removeIdsFromSet(selected: Set<string>, ids: string[]): Set<string> {
   const next = new Set(selected)
   for (const id of ids) next.delete(id)
   return next
+}
+
+function getOpenSessionIds(): Set<string> {
+  return new Set(useTabStore.getState().tabs.flatMap((tab) => tab.type === 'session'
+    ? [tab.sessionId]
+    : tab.type === 'trace' && tab.traceSessionId ? [tab.traceSessionId] : []))
+}
+
+function getProjectHistorySessionIds(projectHistory: Record<string, ProjectHistoryState>): Set<string> {
+  return new Set(Object.values(projectHistory).flatMap((history) => [...history.sessionIds]))
+}
+
+function initialProjectHistoryParams(
+  projectRoot: string,
+  state: Pick<SessionStore, 'recentProjectBoundaries'>,
+): ProjectSessionHistoryParams {
+  // Only the recent page forms a contiguous prefix. An individually restored
+  // old tab cannot serve as the boundary without skipping the history gap.
+  return {
+    projectRoot,
+    limit: PROJECT_HISTORY_PAGE_SIZE,
+    ...state.recentProjectBoundaries[projectRoot],
+  }
+}
+
+function buildRecentProjectBoundaries(sessions: SessionListItem[]): Record<string, RecentProjectBoundary> {
+  const boundaries: Record<string, RecentProjectBoundary> = {}
+  for (const session of sessions) {
+    const root = session.projectRoot || session.workDir || session.projectPath
+    const modifiedAt = Date.parse(session.modifiedAt)
+    if (!root || !Number.isFinite(modifiedAt)) continue
+    const existing = boundaries[root]
+    if (!existing || modifiedAt < Date.parse(existing.beforeModifiedAt) ||
+      (modifiedAt === Date.parse(existing.beforeModifiedAt) && session.id.localeCompare(existing.beforeId) > 0)) {
+      boundaries[root] = { beforeModifiedAt: session.modifiedAt, beforeId: session.id }
+    }
+  }
+  return boundaries
+}
+
+function excludeDeletedProjectSessions(ids: string[]): void {
+  for (const request of projectHistoryRequests.values()) {
+    for (const id of ids) request.excludedSessionIds.add(id)
+  }
+}
+
+function removeProjectHistorySessionIds(
+  projectHistory: Record<string, ProjectHistoryState>,
+  ids: string[],
+): Record<string, ProjectHistoryState> {
+  if (ids.length === 0) return projectHistory
+  return Object.fromEntries(Object.entries(projectHistory).map(([root, history]) => [
+    root,
+    {
+      ...history,
+      sessionIds: removeIdsFromSet(history.sessionIds, ids),
+      excludedSessionIds: new Set([...(history.excludedSessionIds ?? []), ...ids]),
+    },
+  ]))
 }
 
 function buildSessionListParams(project: string | undefined) {

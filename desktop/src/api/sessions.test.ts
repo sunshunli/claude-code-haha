@@ -55,7 +55,21 @@ describe('sessionsApi', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe('http://127.0.0.1:3456/api/sessions/historical-session/summary')
   })
 
-  it.each(['list', 'summary'] as const)('cancels an in-flight history %s request when the caller aborts', async (resource) => {
+  it.each([
+    [{ projectRoot: '/workspace/repo with spaces', limit: 50, cursor: 'opaque+/=' }, 'projectRoot=%2Fworkspace%2Frepo+with+spaces&limit=50&cursor=opaque%2B%2F%3D'],
+    [{ projectRoot: '/workspace/repo', limit: 50, beforeModifiedAt: '2026-08-01T00:00:00.000Z', beforeId: 'boundary-id' }, 'projectRoot=%2Fworkspace%2Frepo&limit=50&beforeModifiedAt=2026-08-01T00%3A00%3A00.000Z&beforeId=boundary-id'],
+  ])('requests logical project history with an opaque cursor or initial boundary', async (params, expectedQuery) => {
+    const page = { sessions: [], nextCursor: 'next-page' }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify(page), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    expect(await sessionsApi.listProjectHistory(params)).toEqual(page)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`http://127.0.0.1:3456/api/sessions/project-history?${expectedQuery}`)
+  })
+
+  it.each(['list', 'summary', 'project'] as const)('cancels an in-flight history %s request when the caller aborts', async (resource) => {
     const controller = new AbortController()
     let requestSignal: AbortSignal | null | undefined
     let resolveFetch!: (response: Response) => void
@@ -69,7 +83,9 @@ describe('sessionsApi', () => {
     const options = { signal: controller.signal }
     const request = (resource === 'list'
       ? sessionsApi.list({ project: '/workspace/repo', limit: 25, offset: 25 }, options)
-      : sessionsApi.getSummary('historical-session', options)).catch(error => error)
+      : resource === 'summary'
+        ? sessionsApi.getSummary('historical-session', options)
+        : sessionsApi.listProjectHistory({ projectRoot: '/workspace/repo', limit: 50 }, options)).catch(error => error)
 
     try {
       expect(requestSignal?.aborted).toBe(false)

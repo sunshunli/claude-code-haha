@@ -69,6 +69,12 @@ import type {
 import type { LocalIndexStatus } from './localIndex/types.js'
 import { diagnosticsService } from './diagnosticsService.js'
 import { isForkInheritedUsageRecord } from '../../utils/usageAccounting.js'
+import {
+  ProjectSessionHistory,
+  type ProjectHistoryOptions,
+  type ProjectHistoryPage,
+  type ProjectHistoryRow,
+} from './projectSessionHistory.js'
 
 // ============================================================================
 // Types
@@ -616,6 +622,7 @@ export class SessionService {
   private readonly sessionListSummaryCache = new Map<string, SessionListSummaryCacheEntry>()
   private readonly sessionListSummaryRequests = new Map<string, Promise<SessionListSummary>>()
   private activeSessionListCacheScope: string | null = null
+  private readonly projectHistory: ProjectSessionHistory
 
   constructor(
     localIndexGateway: LocalIndexGateway = localIndexCoordinator,
@@ -645,6 +652,25 @@ export class SessionService {
       })
     })
     this.targetedEntryReader = options.targetedEntryReader ?? readSessionEntriesByLocator
+    this.projectHistory = new ProjectSessionHistory({
+      now: this.now,
+      scope: () => this.getConfigDir(),
+      revision: () => this.projectHistoryRevision(),
+      mutation: () => `${this.getConfigDir()}:${getSharedSessionMutationState(this.localIndexGateway).epoch}`,
+      load: () => this.loadProjectHistoryRows(),
+      hydrate: async (row) => {
+        try {
+          await this.validateIndexedTranscriptPath(
+            row.transcriptPath, row.projectPath, row.id, await fs.realpath(this.getProjectsDir()),
+          )
+          return await this.hydrateIndexedSession(row)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+          this.markIndexReadFailure()
+          throw new ApiError(409, 'Project history changed; retry from the first page', 'PROJECT_HISTORY_CHANGED')
+        }
+      },
+    })
   }
 
   private normalizeCacheCapacity(value: number | undefined, fallback: number): number {
@@ -3164,9 +3190,75 @@ export class SessionService {
   // Public API
   // --------------------------------------------------------------------------
 
-  /**
-   * List all sessions, optionally filtered by project path.
-   */
+  /** Browse one logical project's history independently of the recent list. */
+  listProjectHistory(options: ProjectHistoryOptions): Promise<ProjectHistoryPage> {
+    return this.projectHistory.list(options)
+  }
+
+  private projectHistoryRevision(): string {
+    this.syncSharedMutationEpoch()
+    const scope = this.getConfigDir()
+    this.prepareSessionListCaches(scope)
+    const indexed = this.getUsableIndexMode() === 'on'
+    const status = indexed ? this.localIndexGateway.getPublicStatus() : null
+    return JSON.stringify([scope, this.sessionListCacheGeneration,
+      indexed && status?.state === 'ready' ? status.lastUpdatedAt : 'files'])
+  }
+
+  private async loadProjectHistoryRows(): Promise<ProjectHistoryRow[]> {
+    const scope = this.getConfigDir()
+    let indexedRows: IndexedSessionRow[] | null = null
+    if (this.getUsableIndexMode() === 'on' && this.localIndexGateway.getPublicStatus().state === 'ready') {
+      try {
+        indexedRows = []
+        // No await between index pages: a coordinator projection cannot shift
+        // the order while this synchronous metadata snapshot is collected.
+        for (let offset = 0; ; offset += 500) {
+          const page = this.localIndexGateway.listSessions({ limit: 500, offset })
+          if (!this.indexStatusRemainsUsable()) throw new Error('Index unavailable')
+          indexedRows.push(...page.sessions)
+          if (offset + page.sessions.length >= page.total) break
+          if (page.sessions.length === 0) throw new Error('Incomplete index page')
+        }
+      } catch {
+        this.markIndexReadFailure()
+        indexedRows = null
+      }
+    }
+    if (indexedRows === null) {
+      indexedRows = []
+      // Files remain authoritative in off/shadow/building mode. Summaries are
+      // streamed and shared with the existing list cache; messages never load.
+      for (const file of await this.discoverSessionFiles(undefined, scope)) {
+        try {
+          const stat = await fs.stat(file.filePath)
+          const summary = await this.getCachedSessionListSummary(file.filePath, file.projectDir, stat, scope)
+          indexedRows.push({ ...summary, id: file.sessionId, projectPath: file.projectDir, transcriptPath: file.filePath })
+        } catch { /* Ignore unreadable transcripts, like the normal list. */ }
+      }
+    }
+
+    const roots = new Map<string, string | null>()
+    const rows: ProjectHistoryRow[] = []
+    for (const row of indexedRows) {
+      // Thousands of sessions normally share a handful of workspaces. Resolve
+      // each candidate once, preserving the same worktree/git boundary as list.
+      const candidate = row.worktreeSession?.originalCwd || row.repository?.repoRoot || row.workDir || this.desanitizePath(row.projectPath)
+      const key = JSON.stringify([candidate, Boolean(row.workDir)])
+      let root = roots.get(key)
+      if (!roots.has(key)) {
+        root = await this.resolveProjectRootFromSessionMetadata({
+          worktreeSession: row.worktreeSession, repository: row.repository,
+          workDir: row.workDir, fallbackProjectDir: row.projectPath,
+        })
+        roots.set(key, root)
+      }
+      rows.push({ ...row, logicalProjectRoot: root || row.workDir || row.projectPath || 'unknown' })
+    }
+    return rows
+  }
+
+  /** List all sessions, optionally filtered by physical project path. */
   async listSessions(options?: {
     project?: string
     limit?: number

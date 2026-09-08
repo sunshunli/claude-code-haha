@@ -1,14 +1,7 @@
 import type { TranslationKey } from './en'
 
 export const zh: Record<TranslationKey, string> = {
-  'sessionHistory.title': '全部歷史對話',
-  'sessionHistory.description': '按最近活動時間瀏覽所有日期、所有專案的對話，每頁最多 50 筆。',
-  'sessionHistory.newest': '最新',
-  'sessionHistory.previous': '上一頁',
-  'sessionHistory.next': '下一頁',
-  'sessionHistory.oldest': '最早',
-  'sessionHistory.range': '第 {start}–{end} 筆，共 {total} 筆',
-  'sessionHistory.indexBuilding': '歷史記錄仍在整理中，重新整理可查看新載入的對話。',
+  'sidebar.projectHistoryFailed': '無法載入更早的對話。',
   // ─── Common ──────────────────────────────────────
   'common.cancel': '取消',
   'common.close': '關閉',
