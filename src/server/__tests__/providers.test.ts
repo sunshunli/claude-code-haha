@@ -149,7 +149,8 @@ async function settlesBeforeBlockedTraceWrite<T>(promise: Promise<T>): Promise<T
   ])
 }
 
-async function captureComputerUseChatRequest(options: {
+async function captureOpenAIChatRequest(options: {
+  contentSource?: 'user' | 'tool'
   baseUrl: string
   model: string
   content: Array<Record<string, unknown>>
@@ -193,7 +194,7 @@ async function captureComputerUseChatRequest(options: {
         max_tokens: 64,
         messages: [{
           role: 'user',
-          content: [{
+          content: options.contentSource === 'user' ? options.content : [{
             type: 'tool_result',
             tool_use_id: 'computer_1',
             content: options.content,
@@ -2107,9 +2108,13 @@ describe('ProviderService', () => {
       }
     })
 
-    test('preserves Computer Use tool images for explicit opencode vision models', async () => {
-      const body = await captureComputerUseChatRequest({
-        baseUrl: 'https://opencode.ai/zen',
+    test.each([
+      'https://opencode.ai/zen',
+      'https://api.deepseek.com',
+      'https://gateway.example.test',
+    ])('preserves Computer Use tool images for explicit vision models at %s', async (baseUrl) => {
+      const body = await captureOpenAIChatRequest({
+        baseUrl,
         model: 'deepseek-v4-flash-vision-exp',
         content: [
           { type: 'text', text: 'Computer Use state' },
@@ -2142,12 +2147,12 @@ describe('ProviderService', () => {
         model: 'deepseek-v4-flash',
       },
       {
-        name: 'classic DeepSeek endpoint even with a vision-named model',
+        name: 'classic DeepSeek text model',
         baseUrl: 'https://api.deepseek.com',
-        model: 'deepseek-v4-flash-vision-exp',
+        model: 'deepseek-v4-flash',
       },
     ])('uses text-only Computer Use content for $name', async ({ baseUrl, model }) => {
-      const body = await captureComputerUseChatRequest({
+      const body = await captureOpenAIChatRequest({
         baseUrl,
         model,
         content: [{
@@ -2166,8 +2171,33 @@ describe('ProviderService', () => {
       expect(JSON.stringify(body)).not.toContain('image_url')
     })
 
+    test.each([
+      { baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-flash-vision-exp' },
+      { baseUrl: 'https://gateway.example.test', model: 'deepseek-v4-flash-vision-exp' },
+      { baseUrl: 'https://opencode.ai/zen', model: 'deepseek-v4-flash-vision-exp' },
+    ])('forwards chat attachments for $model at $baseUrl (#1304)', async ({ baseUrl, model }) => {
+      const body = await captureOpenAIChatRequest({
+        baseUrl,
+        model,
+        contentSource: 'user',
+        content: [
+          { type: 'text', text: 'Describe this picture.' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'picture-data' } },
+        ],
+      })
+
+      expect(body.messages).toEqual([{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe this picture.' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,picture-data' } },
+        ],
+      }])
+      expect(JSON.stringify(body)).not.toContain('Image omitted:')
+    })
+
     test('keeps generic OpenAI Chat providers vision-capable by default', async () => {
-      const body = await captureComputerUseChatRequest({
+      const body = await captureOpenAIChatRequest({
         baseUrl: 'https://chat.example.test',
         model: 'custom-text-named-model',
         content: [{

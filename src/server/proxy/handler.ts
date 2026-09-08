@@ -827,8 +827,11 @@ function shouldUseDeepSeekReasoningCompat(baseUrl: string): boolean {
 }
 
 function shouldUseTextOnlyOpenAIChatContent(baseUrl: string, model: string): boolean {
-  // DeepSeek's classic Chat endpoint accepts string content only.
-  if (/(^|[./-])deepseek([./-]|$)/i.test(baseUrl)) return true
+  // Keep classic DeepSeek text models compatible without dropping images for
+  // explicitly vision-capable models served by the same Chat endpoint.
+  if (/(^|[./-])deepseek([./-]|$)/i.test(baseUrl)) {
+    return !hasExplicitVisionModelMarker(model)
+  }
 
   // image_url inside a tool message is a gateway extension, not a universal
   // Chat Completions contract. Only opt opencode models in when their id
