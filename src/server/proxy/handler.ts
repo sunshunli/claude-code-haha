@@ -9,6 +9,7 @@
  * Original work by Jason Young, MIT License
  */
 
+import { getOpenAIPolicyError } from '../../services/openaiAuth/policyError.js'
 import { createGunzip, createInflate } from 'node:zlib'
 
 import { ProviderService } from '../services/providerService.js'
@@ -267,15 +268,16 @@ export async function handleProxyRequest(req: Request, url: URL): Promise<Respon
       }).catch(() => {})
     }
     console.error('[Proxy] Upstream request failed:', err)
+    const policyError = getOpenAIPolicyError(err)
     return Response.json(
       {
         type: 'error',
-        error: {
+        error: policyError ? { type: 'permission_error', ...policyError } : {
           type: 'api_error',
           message: err instanceof Error ? err.message : String(err),
         },
       },
-      { status: 502 },
+      { status: policyError ? 403 : 502 },
     )
   }
 }
@@ -707,9 +709,15 @@ async function handleOpenaiChat(
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
+    let policyError = null
+    try {
+      policyError = getOpenAIPolicyError(JSON.parse(errText))
+    } catch {
+      // Unstructured upstream failures keep their existing error classification.
+    }
     const errorBody = {
       type: 'error',
-      error: {
+      error: policyError ? { type: 'permission_error', ...policyError } : {
         type: 'api_error',
         message: `Upstream returned HTTP ${upstream.status}: ${errText.slice(0, 500)}`,
       },
@@ -732,7 +740,7 @@ async function handleOpenaiChat(
     }
     return Response.json(
       errorBody,
-      { status: upstream.status },
+      { status: policyError ? 403 : upstream.status },
     )
   }
 
@@ -788,7 +796,10 @@ async function handleOpenaiChat(
 
   // Non-streaming
   const responseBody = await upstream.json()
-  const anthropicResponse = openaiChatToAnthropic(responseBody, body.model)
+  const policyError = getOpenAIPolicyError(responseBody)
+  const anthropicResponse = policyError
+    ? { type: 'error', error: { type: 'permission_error', ...policyError } }
+    : openaiChatToAnthropic(responseBody, body.model)
   if (traceContext) {
     recordProxyTraceInBackground({
       callId: traceCallId,
@@ -805,7 +816,7 @@ async function handleOpenaiChat(
       responseHeaders: upstream.headers,
     })
   }
-  return Response.json(anthropicResponse)
+  return Response.json(anthropicResponse, { status: policyError ? 403 : 200 })
 }
 
 function shouldUseDeepSeekReasoningCompat(baseUrl: string): boolean {
@@ -892,9 +903,15 @@ async function handleOpenaiResponses(
 
   if (!upstream.ok) {
     const errText = await upstream.text().catch(() => '')
+    let policyError = null
+    try {
+      policyError = getOpenAIPolicyError(JSON.parse(errText))
+    } catch {
+      // Unstructured upstream failures keep their existing error classification.
+    }
     const errorBody = {
       type: 'error',
-      error: {
+      error: policyError ? { type: 'permission_error', ...policyError } : {
         type: 'api_error',
         message: `Upstream returned HTTP ${upstream.status}: ${errText.slice(0, 500)}`,
       },
@@ -917,7 +934,7 @@ async function handleOpenaiResponses(
     }
     return Response.json(
       errorBody,
-      { status: upstream.status },
+      { status: policyError ? 403 : upstream.status },
     )
   }
 
@@ -973,7 +990,10 @@ async function handleOpenaiResponses(
 
   // Non-streaming
   const responseBody = await upstream.json()
-  const anthropicResponse = openaiResponsesToAnthropic(responseBody, body.model)
+  const policyError = getOpenAIPolicyError(responseBody)
+  const anthropicResponse = policyError
+    ? { type: 'error', error: { type: 'permission_error', ...policyError } }
+    : openaiResponsesToAnthropic(responseBody, body.model)
   if (traceContext) {
     recordProxyTraceInBackground({
       callId: traceCallId,
@@ -990,7 +1010,7 @@ async function handleOpenaiResponses(
       responseHeaders: upstream.headers,
     })
   }
-  return Response.json(anthropicResponse)
+  return Response.json(anthropicResponse, { status: policyError ? 403 : 200 })
 }
 
 function buildProxyTraceContext(

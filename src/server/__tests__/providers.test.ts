@@ -585,6 +585,7 @@ describe('ProviderService', () => {
           'gpt-5.4': 950_000,
           'gpt-5.5': 258_400,
           'gpt-5.4-mini': 258_400,
+          'gpt-6-astra': 997_500,
         })
         expect(env.ANTHROPIC_BASE_URL).toBeUndefined()
         expect(env.ANTHROPIC_API_KEY).toBeUndefined()

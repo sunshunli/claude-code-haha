@@ -1155,6 +1155,7 @@ describe('Models API', () => {
       'gpt-5.4',
       'gpt-5.5',
       'gpt-5.4-mini',
+      'gpt-6-astra',
     ])
     expect(body.models[0]).toMatchObject({
       id: 'gpt-5.6-sol',
