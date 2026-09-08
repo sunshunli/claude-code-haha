@@ -1929,6 +1929,104 @@ describe('chatStore history mapping', () => {
     if (timer) clearInterval(timer)
   })
 
+  it.each([
+    ['stream retry', 'thinking'],
+    ['stream retry', 'none'],
+    ['stream retry', 'merged tool'],
+    ['stream retry', 'ambiguous tool'],
+    ['running snapshot', 'thinking'],
+    ['running snapshot', 'none'],
+    ['running snapshot', 'merged tool'],
+    ['running snapshot', 'ambiguous tool'],
+  ] as const)(
+    'preserves cold history through a %s when attempt output is %s',
+    async (reset, attemptOutput) => {
+      const sessionId = `cold-attempt-${reset}-${attemptOutput}`
+      let resolveHistory!: (value: { messages: MessageEntry[] }) => void
+      vi.mocked(sessionsApi.getMessages).mockReturnValueOnce(new Promise((resolve) => {
+        resolveHistory = resolve
+      }))
+      useChatStore.getState().connectToSession(sessionId, { minimalBootstrap: true })
+      try {
+        const historyLoad = useChatStore.getState().loadHistory(sessionId)
+        useChatStore.getState().handleServerMessage(sessionId, {
+          type: 'status',
+          state: 'thinking',
+          attemptStart: true,
+        })
+        if (attemptOutput === 'thinking') {
+          useChatStore.getState().handleServerMessage(sessionId, {
+            type: 'thinking',
+            text: 'discard this failed attempt',
+            complete: true,
+          })
+        } else if (attemptOutput !== 'none') {
+          useChatStore.getState().handleServerMessage(sessionId, {
+            type: 'content_start',
+            blockType: 'tool_use',
+            toolUseId: 'attempt-tool',
+            toolName: 'Read',
+          })
+        }
+        const liveToolId = useChatStore.getState().getSession(sessionId).messages[0]?.id
+        const durableTools: MessageEntry[] = Array.from({
+          length: attemptOutput === 'merged tool' ? 1 : attemptOutput === 'ambiguous tool' ? 2 : 0,
+        }, (_, index) => ({
+          id: `restored-tool-${index}`,
+          type: 'assistant',
+          timestamp: '2026-08-31T00:00:02.000Z',
+          content: [{ type: 'tool_use', id: 'attempt-tool', name: 'Read', input: {} }],
+        }))
+        resolveHistory({ messages: [
+          {
+            id: 'restored-user',
+            type: 'user',
+            timestamp: '2026-08-31T00:00:00.000Z',
+            content: 'old prompt',
+          },
+          {
+            id: 'restored-assistant',
+            type: 'assistant',
+            timestamp: '2026-08-31T00:00:01.000Z',
+            content: [{ type: 'text', text: 'old answer' }],
+          },
+          ...durableTools,
+        ] })
+        await historyLoad
+        const hydratedMessages = useChatStore.getState().getSession(sessionId).messages
+        expect(hydratedMessages).toEqual(
+          expect.arrayContaining([expect.objectContaining({ content: 'old answer' })]),
+        )
+        if (attemptOutput === 'merged tool') {
+          const tools = hydratedMessages.filter((message) => message.type === 'tool_use')
+          expect(tools).toHaveLength(1)
+          expect(tools[0]?.id).not.toBe(liveToolId)
+        }
+        if (attemptOutput === 'none') {
+          useChatStore.getState().handleServerMessage(sessionId, {
+            type: 'thinking',
+            text: 'discard output received after hydration',
+            complete: true,
+          })
+        }
+
+        useChatStore.getState().handleServerMessage(sessionId, reset === 'stream retry'
+          ? { type: 'streaming_fallback', cause: 'stream_retry' }
+          : { type: 'session_state', turnState: 'running' })
+
+        expect(useChatStore.getState().getSession(sessionId).messages).toMatchObject([
+          { type: 'user_text', content: 'old prompt' },
+          { type: 'assistant_text', content: 'old answer' },
+          ...(attemptOutput === 'ambiguous tool'
+            ? [{ type: 'tool_use' }, { type: 'tool_use' }]
+            : []),
+        ])
+      } finally {
+        useChatStore.getState().disconnectSession(sessionId)
+      }
+    },
+  )
+
   it('treats the first history load as cold when a live task arrived before it started', async () => {
     const sessionId = 'cold-live-before-load'
     let resolveHistory!: (value: { messages: MessageEntry[] }) => void

@@ -1570,6 +1570,33 @@ function strongHistoryMessageIdentities(message: UIMessage): string[] {
   return identities
 }
 
+function rebaseStreamAttemptStartIndex(
+  previousMessages: UIMessage[],
+  messages: UIMessage[],
+  startIndex: number | undefined,
+): number | undefined {
+  if (startIndex === undefined) return undefined
+  // Cold hydration prepends durable rows and can replace a live tool's UI id.
+  // Find the surviving attempt by unique identity so retry cleanup cannot
+  // mistake recovered history for output from the failed stream attempt.
+  const attemptIdentities = new Set(
+    previousMessages.slice(startIndex).flatMap(strongHistoryMessageIdentities),
+  )
+  const matchingIndexes = new Map<string, number | null>()
+  for (const [index, message] of messages.entries()) {
+    for (const identity of strongHistoryMessageIdentities(message)) {
+      if (!attemptIdentities.has(identity)) continue
+      matchingIndexes.set(identity, matchingIndexes.has(identity) ? null : index)
+    }
+  }
+  // With no surviving attempt rows, all restored rows precede future deltas.
+  let rebasedIndex = messages.length
+  for (const index of matchingIndexes.values()) {
+    if (index !== null) rebasedIndex = Math.min(rebasedIndex, index)
+  }
+  return rebasedIndex
+}
+
 function didToolFieldChangeAfterRestoredBaseline<K extends keyof ToolCall>(
   liveMessage: ToolCall,
   previousRestoredMessage: ToolCall | undefined,
@@ -3336,6 +3363,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 historyStatus: 'ready',
                 historyHydrated: true,
                 historyError: null,
+                ...(shouldBackfillColdHistory ? {
+                  streamAttemptStartIndex: rebaseStreamAttemptStartIndex(
+                    s.messages,
+                    messages,
+                    s.streamAttemptStartIndex,
+                  ),
+                } : {}),
                 activeGoal: activeGoalAfterHistoryLoad(
                   s,
                   requestedActiveGoalRevision,
@@ -3414,6 +3448,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
               historyStatus: 'ready',
               historyHydrated: true,
               historyError: null,
+              ...(shouldBackfillColdHistory ? {
+                streamAttemptStartIndex: rebaseStreamAttemptStartIndex(
+                  s.messages,
+                  messages,
+                  s.streamAttemptStartIndex,
+                ),
+              } : {}),
               activeGoal: activeGoalAfterHistoryLoad(
                 s,
                 requestedActiveGoalRevision,
