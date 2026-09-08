@@ -1,6 +1,14 @@
 import type { TranslationKey } from './en'
 
 export const jp: Record<TranslationKey, string> = {
+  'sessionHistory.title': 'すべての会話履歴',
+  'sessionHistory.description': 'すべての日付とプロジェクトの会話を更新順に表示します。1ページ最大50件です。',
+  'sessionHistory.newest': '最新',
+  'sessionHistory.previous': '前へ',
+  'sessionHistory.next': '次へ',
+  'sessionHistory.oldest': '最古',
+  'sessionHistory.range': '{total} 件中 {start}–{end} 件',
+  'sessionHistory.indexBuilding': '履歴の索引を作成中です。更新すると新しく読み込まれた会話を確認できます。',
   // ─── Common ──────────────────────────────────────
   'common.cancel': 'キャンセル',
   'common.close': '閉じる',

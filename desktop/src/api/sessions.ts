@@ -373,17 +373,21 @@ function buildWorkspacePath(
 }
 
 export const sessionsApi = {
-  list(params?: { project?: string; limit?: number; offset?: number }) {
+  list(params?: { project?: string; limit?: number; offset?: number }, options?: ApiRequestOptions) {
     const query = new URLSearchParams()
     if (params?.project) query.set('project', params.project)
     if (params?.limit) query.set('limit', String(params.limit))
     if (params?.offset) query.set('offset', String(params.offset))
     const qs = query.toString()
-    return api.get<SessionsResponse>(`/api/sessions${qs ? `?${qs}` : ''}`)
+    return api.get<SessionsResponse>(`/api/sessions${qs ? `?${qs}` : ''}`, options)
   },
 
   getMessages(sessionId: string) {
     return api.get<MessagesResponse>(`/api/sessions/${sessionId}/messages`)
+  },
+
+  getSummary(sessionId: string, options?: ApiRequestOptions) {
+    return api.get<SessionListItem>(`/api/sessions/${sessionId}/summary`, options)
   },
 
   getChatStatus(sessionId: string, signal?: AbortSignal) {

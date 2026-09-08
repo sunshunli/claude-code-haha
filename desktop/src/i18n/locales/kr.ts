@@ -1,6 +1,14 @@
 import type { TranslationKey } from './en'
 
 export const kr: Record<TranslationKey, string> = {
+  'sessionHistory.title': '전체 대화 기록',
+  'sessionHistory.description': '모든 날짜와 프로젝트의 대화를 최근 활동순으로 표시합니다. 페이지당 최대 50개입니다.',
+  'sessionHistory.newest': '최신',
+  'sessionHistory.previous': '이전',
+  'sessionHistory.next': '다음',
+  'sessionHistory.oldest': '가장 오래된',
+  'sessionHistory.range': '총 {total}개 중 {start}–{end}',
+  'sessionHistory.indexBuilding': '기록을 색인하는 중입니다. 새로 고침하면 추가된 대화를 볼 수 있습니다.',
   // ─── Common ──────────────────────────────────────
   'common.cancel': '취소',
   'common.close': '닫기',

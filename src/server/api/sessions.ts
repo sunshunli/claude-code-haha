@@ -6,6 +6,7 @@
  * Routes:
  *   GET    /api/sessions            — 列出会话
  *   GET    /api/sessions/:id        — 获取会话详情
+ *   GET    /api/sessions/:id/summary — 获取不含消息的会话元数据
  *   GET    /api/sessions/:id/messages — 获取会话消息
  *   GET    /api/sessions/:id/subagents/by-tool/:toolUseId — 获取 SubAgent 运行详情
  *   POST   /api/sessions/:id/subagents/by-tool/:toolUseId/messages — 继续与 SubAgent 对话
@@ -132,6 +133,18 @@ export async function handleSessionsApi(
     // -----------------------------------------------------------------------
     // Sub-resource routes: /api/sessions/:id/messages
     // -----------------------------------------------------------------------
+    if (subResource === 'summary') {
+      if (req.method !== 'GET') {
+        return Response.json(
+          { error: 'METHOD_NOT_ALLOWED', message: `Method ${req.method} not allowed` },
+          { status: 405 }
+        )
+      }
+      const summary = await sessionService.getSessionSummary(sessionId)
+      if (!summary) throw ApiError.notFound(`Session not found: ${sessionId}`)
+      return Response.json(summary)
+    }
+
     if (subResource === 'messages') {
       if (req.method !== 'GET') {
         return Response.json(

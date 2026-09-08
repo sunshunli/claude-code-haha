@@ -31,8 +31,11 @@ type SessionStore = {
   sessionListRequestId: number
   isBatchMode: boolean
   selectedSessionIds: Set<string>
+  historicalSessionIds: Set<string>
 
   fetchSessions: (project?: string) => Promise<void>
+  hydrateHistoricalSessions: (sessions: SessionListItem[]) => SessionListItem[]
+  openHistoricalSession: (session: SessionListItem) => void
   createSession: (workDir?: string, options?: CreateSessionOptions) => Promise<string>
   branchSession: (
     sourceSessionId: string,
@@ -68,6 +71,7 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   sessionListRequestId: 0,
   isBatchMode: false,
   selectedSessionIds: new Set(),
+  historicalSessionIds: new Set(),
 
   fetchSessions: async (project?: string) => {
     const requestId = ++fetchSessionsRequestId
@@ -81,16 +85,32 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       let syncedSessions: SessionListItem[] = []
       set((state) => {
         if (requestId !== state.sessionListRequestId) return state
-        const incomingSessions = reconcilePendingCreatedSessions(raw, state.sessions)
+        const openSessionIds = new Set(useTabStore.getState().tabs
+          .flatMap((tab) => tab.type === 'session'
+            ? [tab.sessionId]
+            : tab.type === 'trace' && tab.traceSessionId ? [tab.traceSessionId] : []))
+        const historicalSessionIds = new Set([...state.historicalSessionIds]
+          .filter((id) => openSessionIds.has(id)))
+        // Only explicitly opened history needs metadata outside the recent
+        // page. Closing its tab releases it even while the index is building.
+        const retainedSessions = state.sessions.filter((session) => (
+          !state.historicalSessionIds.has(session.id) || historicalSessionIds.has(session.id)
+        ))
+        const incomingSessions = reconcilePendingCreatedSessions(raw, retainedSessions)
+        const incomingIds = new Set(incomingSessions.map((session) => session.id))
+        const retainedHistory = retainedSessions.filter((session) => (
+          historicalSessionIds.has(session.id) && !incomingIds.has(session.id)
+        ))
         const sessions = mergeSessionList(
           shouldRetainRenderedSessions(indexStatus)
-            ? [...incomingSessions, ...state.sessions]
-            : incomingSessions,
+            ? [...incomingSessions, ...retainedSessions]
+            : [...incomingSessions, ...retainedHistory],
           state.sessions,
         )
         syncedSessions = sessions
         return {
           sessions,
+          historicalSessionIds,
           indexStatus,
           isLoading: indexStatus?.state === 'building' && sessions.length === 0,
         }
@@ -100,6 +120,30 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       if (requestId !== get().sessionListRequestId) return
       set({ error: (err as Error).message, isLoading: false })
     }
+  },
+
+  hydrateHistoricalSessions: (snapshots) => {
+    if (snapshots.length === 0) return []
+    const selected = reconcileSessionSnapshots(snapshots, get().sessions)
+    const selectedIds = new Set(selected.map((session) => session.id))
+    // Hydrate before activating the tab: connecting immediately applies its
+    // runtime selection and the composer reads workspace/permission metadata.
+    useSessionRuntimeStore.getState().syncFromSessions(selected)
+    set((state) => ({
+      sessions: mergeSessionList([
+        ...selected,
+        ...state.sessions.filter((item) => !selectedIds.has(item.id)),
+      ], state.sessions),
+      historicalSessionIds: new Set([...state.historicalSessionIds, ...selectedIds]),
+    }))
+    return selected
+  },
+
+  openHistoricalSession: (session) => {
+    const [selected] = get().hydrateHistoricalSessions([session])
+    if (!selected) return
+    set({ activeSessionId: selected.id })
+    useTabStore.getState().openTab(selected.id, selected.title)
   },
 
   createSession: async (workDir?: string, options?: CreateSessionOptions) => {
@@ -182,8 +226,11 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     useSessionRuntimeStore.getState().clearSelection(id)
     set((s) => ({
       sessions: s.sessions.filter((session) => session.id !== id),
+      historicalSessionIds: removeIdsFromSet(s.historicalSessionIds, [id]),
       activeSessionId: s.activeSessionId === id ? null : s.activeSessionId,
       selectedSessionIds: removeIdsFromSet(s.selectedSessionIds, [id]),
+      sessionListRequestId: ++fetchSessionsRequestId,
+      isLoading: false,
     }))
   },
 
@@ -199,10 +246,14 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     }
     set((s) => ({
       sessions: s.sessions.filter((session) => !result.successes.includes(session.id)),
+      historicalSessionIds: removeIdsFromSet(s.historicalSessionIds, result.successes),
       activeSessionId: s.activeSessionId && result.successes.includes(s.activeSessionId)
         ? null
         : s.activeSessionId,
       selectedSessionIds: removeIdsFromSet(s.selectedSessionIds, result.successes),
+      ...(result.successes.length > 0
+        ? { sessionListRequestId: ++fetchSessionsRequestId, isLoading: false }
+        : {}),
     }))
     return result
   },
@@ -280,6 +331,21 @@ function buildSessionListParams(project: string | undefined) {
 function getDefaultSessionPermissionMode(): PermissionMode | undefined {
   const mode = useSettingsStore.getState().permissionMode
   return mode === 'default' ? undefined : mode
+}
+
+export function reconcileSessionSnapshots(
+  snapshots: SessionListItem[],
+  currentSessions: SessionListItem[],
+): SessionListItem[] {
+  const currentById = new Map(currentSessions.map((session) => [session.id, session]))
+  // History pages and tab restoration both outlive sidebar refreshes. Keep
+  // newer local data, including metadata edits with unchanged activity time.
+  return snapshots.map((snapshot) => {
+    const current = currentById.get(snapshot.id)
+    return current && sessionModifiedTime(current) >= sessionModifiedTime(snapshot)
+      ? current
+      : snapshot
+  })
 }
 
 function mergeSessionList(

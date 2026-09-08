@@ -393,6 +393,27 @@ function projectGroupNames(): string[] {
 }
 
 describe('Sidebar', () => {
+  it('offers on-demand history even when no recent project is visible', async () => {
+    sessionsApiMock.list.mockResolvedValue({ sessions: [
+      makeSession('old-only', 'A year-old conversation', '/archive/old-project', '2025-01-01T00:00:00.000Z'),
+    ], total: 1 })
+    render(<Sidebar />)
+    expect(sessionsApiMock.list).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'sessionHistory.title' }))
+    expect(await screen.findByRole('dialog', { name: 'sessionHistory.title' })).toBeInTheDocument()
+    expect(await screen.findByText('A year-old conversation')).toBeInTheDocument()
+    expect(sessionsApiMock.list).toHaveBeenCalledWith({ limit: 50, offset: 0 }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect(useSessionStore.getState().sessions).toEqual([])
+    connectToSession.mockImplementation((id: string) => {
+      expect(useSessionStore.getState().sessions.find((session) => session.id === id)?.workDir)
+        .toBe('/archive/old-project')
+    })
+    fireEvent.click(screen.getByText('A year-old conversation'))
+    expect(connectToSession).toHaveBeenCalledWith('old-only')
+    expect(useTabStore.getState().activeTabId).toBe('old-only')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
   const connectToSession = vi.fn()
   const disconnectSession = vi.fn()
   const fetchSessions = vi.fn()

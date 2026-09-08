@@ -8,6 +8,82 @@ describe('sessionsApi', () => {
     vi.restoreAllMocks()
   })
 
+  it('lists a project history page without excluding sessions older than 30 days', async () => {
+    const session = {
+      id: 'old-session',
+      title: 'Archived work',
+      createdAt: '2020-01-01T00:00:00.000Z',
+      modifiedAt: '2020-01-02T00:00:00.000Z',
+      messageCount: 12,
+      projectPath: '/workspace/older project',
+      workDir: '/workspace/older project',
+      workDirExists: true,
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({
+      sessions: [session],
+      total: 51,
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    const result = await sessionsApi.list({ project: session.projectPath, limit: 25, offset: 50 })
+
+    expect(result).toEqual({ sessions: [session], total: 51 })
+    expect(fetchMock).toHaveBeenCalledOnce()
+    const [url, init] = fetchMock.mock.calls[0]!
+    expect(url).toBe('http://127.0.0.1:3456/api/sessions?project=%2Fworkspace%2Folder+project&limit=25&offset=50')
+    expect(init).toMatchObject({ method: 'GET' })
+  })
+
+  it('fetches one historical session summary without requesting its messages', async () => {
+    const summary = {
+      id: 'historical-session',
+      title: 'Old conversation',
+      runtimeProviderId: 'fixture-provider',
+      runtimeModelId: 'fixture-model',
+      permissionMode: 'plan',
+      workspaceState: 'worktree_removed',
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify(summary), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    expect(await sessionsApi.getSummary(summary.id)).toEqual(summary)
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://127.0.0.1:3456/api/sessions/historical-session/summary')
+  })
+
+  it.each(['list', 'summary'] as const)('cancels an in-flight history %s request when the caller aborts', async (resource) => {
+    const controller = new AbortController()
+    let requestSignal: AbortSignal | null | undefined
+    let resolveFetch!: (response: Response) => void
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementationOnce((_url, init) => {
+      requestSignal = init?.signal
+      return new Promise<Response>((resolve, reject) => {
+        resolveFetch = resolve
+        requestSignal?.addEventListener('abort', () => reject(requestSignal?.reason), { once: true })
+      })
+    })
+    const options = { signal: controller.signal }
+    const request = (resource === 'list'
+      ? sessionsApi.list({ project: '/workspace/repo', limit: 25, offset: 25 }, options)
+      : sessionsApi.getSummary('historical-session', options)).catch(error => error)
+
+    try {
+      expect(requestSignal?.aborted).toBe(false)
+      controller.abort()
+
+      expect(requestSignal?.aborted).toBe(true)
+      await expect(request).resolves.toMatchObject({ name: 'AbortError' })
+      expect(fetchMock).toHaveBeenCalledOnce()
+    } finally {
+      resolveFetch(new Response(JSON.stringify({ sessions: [], total: 0 })))
+      await request
+    }
+  })
+
   it('posts branch requests to the session branch endpoint', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({

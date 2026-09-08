@@ -15,6 +15,7 @@ import { GlobalSearchModal } from '../search/GlobalSearchModal'
 import { FindInPageModal } from '../search/FindInPageModal'
 import { ProjectEditorModal, type ProjectEditorSubmission } from './ProjectEditorModal'
 import { SidebarTaskList } from './SidebarTaskList'
+import { SessionHistoryModal } from '@/components/layout/SessionHistoryModal'
 import {
   buildSidebarTaskGroups,
   getSessionProjectKey,
@@ -112,6 +113,7 @@ export function Sidebar({
   onDesktopUiPreferencesConsumed,
 }: SidebarProps) {
   const t = useTranslation()
+  const [historyOpen, setHistoryOpen] = useState(false)
   const sessions = useSessionStore((s) => s.sessions)
   const isLoading = useSessionStore((s) => s.isLoading)
   const error = useSessionStore((s) => s.error)
@@ -1033,6 +1035,16 @@ export function Sidebar({
         >
           {t('sidebar.newSession')}
         </NavItem>
+        <NavItem
+          active={historyOpen}
+          collapsed={!expanded}
+          label={t('sessionHistory.title')}
+          touchFriendly={isMobile}
+          onClick={() => setHistoryOpen(true)}
+          icon={<Clock className="h-4 w-4" aria-hidden="true" />}
+        >
+          {t('sessionHistory.title')}
+        </NavItem>
         {!isMobile && (
           <NavItem
             active={activeTabId === SCHEDULED_TAB_ID}
@@ -1672,6 +1684,17 @@ export function Sidebar({
       />
 
       <GlobalSearchModal open={activeModal === 'globalSearch'} onClose={closeModal} />
+      {historyOpen && (
+        <SessionHistoryModal
+          onClose={() => setHistoryOpen(false)}
+          onSelect={(session) => {
+            useSessionStore.getState().openHistoricalSession(session)
+            useChatStore.getState().connectToSession(session.id)
+            setHistoryOpen(false)
+            closeMobileDrawer()
+          }}
+        />
+      )}
       <FindInPageModal open={activeModal === 'findInPage'} onClose={closeModal} />
     </aside>
   )

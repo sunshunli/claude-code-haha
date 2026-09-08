@@ -1,4 +1,12 @@
 export const en = {
+  'sessionHistory.title': 'All session history',
+  'sessionHistory.description': 'Browse conversations from every date and project, newest first. Each page shows up to 50 conversations.',
+  'sessionHistory.newest': 'Newest',
+  'sessionHistory.previous': 'Previous',
+  'sessionHistory.next': 'Next',
+  'sessionHistory.oldest': 'Oldest',
+  'sessionHistory.range': '{start}–{end} of {total}',
+  'sessionHistory.indexBuilding': 'History is still being indexed. Refresh to see newly available conversations.',
   // ─── Common ──────────────────────────────────────
   'common.cancel': 'Cancel',
   'common.close': 'Close',

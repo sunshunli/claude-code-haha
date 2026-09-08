@@ -3546,6 +3546,30 @@ export class SessionService {
     return result
   }
 
+  /** Resolve one session's list metadata without materializing its messages. */
+  async getSessionSummary(sessionId: string): Promise<SessionListItem | null> {
+    this.syncSharedMutationEpoch()
+    const scope = this.getConfigDir()
+    this.prepareSessionListCaches(scope)
+    const found = await this.findSessionFile(sessionId)
+    if (!found) return null
+
+    try {
+      const { filePath, projectDir } = found
+      const stat = await fs.stat(filePath)
+      const summary = await this.getCachedSessionListSummary(filePath, projectDir, stat, scope)
+      return await this.hydrateIndexedSession({
+        ...summary,
+        id: sessionId,
+        projectPath: projectDir,
+        transcriptPath: filePath,
+      })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
+  }
+
   /**
    * Get full session detail including all messages.
    */

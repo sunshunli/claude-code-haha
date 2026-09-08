@@ -255,6 +255,142 @@ describe('sessionStore', () => {
     })
   })
 
+  it('hydrates only the selected historical session before activating its tab', () => {
+    const historical = {
+      ...makeSession('history-opened', '2025-01-01T00:00:00.000Z', 'Old worktree'),
+      workDir: '/workspace/project/.claude/worktrees/old',
+      workDirExists: false,
+      workspaceState: 'worktree_removed' as const,
+      permissionMode: 'acceptEdits',
+      runtimeProviderId: 'provider-current',
+      runtimeModelId: 'model-current',
+      effortLevel: 'high' as const,
+    }
+    useSessionRuntimeStore.getState().setSelection(historical.id, {
+      providerId: 'provider-stale',
+      modelId: 'model-stale',
+    })
+    let observedAtActivation: unknown
+    const unsubscribe = useTabStore.subscribe((state) => {
+      if (state.activeTabId !== historical.id) return
+      observedAtActivation = {
+        session: useSessionStore.getState().sessions.find((session) => session.id === historical.id),
+        runtime: useSessionRuntimeStore.getState().selections[historical.id],
+      }
+    })
+
+    try {
+      useSessionStore.getState().openHistoricalSession(historical)
+    } finally {
+      unsubscribe()
+    }
+
+    expect(observedAtActivation).toEqual({
+      session: historical,
+      runtime: {
+        providerId: 'provider-current',
+        modelId: 'model-current',
+        effortLevel: 'high',
+      },
+    })
+    expect(useTabStore.getState().tabs).toEqual([
+      expect.objectContaining({ sessionId: historical.id, title: historical.title, type: 'session' }),
+    ])
+    expect(useSessionStore.getState().historicalSessionIds).toEqual(new Set([historical.id]))
+    expect(listMock).not.toHaveBeenCalled()
+  })
+
+  it.each(['2025-01-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z'])(
+    'keeps current metadata when the history snapshot is not newer (%s)',
+    (snapshotTime) => {
+      const current = {
+        ...makeSession('history-current', '2026-08-01T00:00:00.000Z', 'Current title'),
+        permissionMode: 'plan',
+        runtimeProviderId: 'provider-current',
+        runtimeModelId: 'model-current',
+      }
+      const snapshot = {
+        ...current,
+        title: 'Stale history title',
+        modifiedAt: snapshotTime,
+        workDir: '/workspace/stale-worktree',
+        permissionMode: 'acceptEdits',
+        runtimeProviderId: 'provider-stale',
+        runtimeModelId: 'model-stale',
+      }
+      useSessionStore.setState({ sessions: [current] })
+
+      useSessionStore.getState().openHistoricalSession(snapshot)
+
+      expect(useSessionStore.getState().sessions).toEqual([current])
+      expect(useSessionRuntimeStore.getState().selections[current.id]).toEqual({
+        providerId: 'provider-current',
+        modelId: 'model-current',
+      })
+      expect(useTabStore.getState().tabs[0]?.title).toBe(current.title)
+    },
+  )
+
+  it.each(['ready', 'building'] as const)('retains opened history across bounded %s refreshes and releases closed tabs', async (indexState) => {
+    const historical = makeSession('history-retained', '2025-01-01T00:00:00.000Z')
+    const recent = makeSession('history-recent', '2026-08-01T00:00:00.000Z')
+    listMock.mockResolvedValue({
+      sessions: [recent],
+      total: 2000,
+      index: makeIndexStatus(indexState, 1000, 2000),
+    })
+    useSessionStore.getState().openHistoricalSession(historical)
+    useSessionStore.getState().updateSessionPermissionMode(historical.id, 'plan')
+
+    await useSessionStore.getState().fetchSessions()
+    expect(useSessionStore.getState().sessions).toEqual([
+      recent,
+      { ...historical, permissionMode: 'plan' },
+    ])
+    expect(listMock).toHaveBeenLastCalledWith({ limit: 400 })
+
+    useTabStore.getState().closeTab(historical.id)
+    await useSessionStore.getState().fetchSessions()
+    expect(useSessionStore.getState().sessions).toEqual([recent])
+    expect(useSessionStore.getState().historicalSessionIds).toEqual(new Set())
+    expect(listMock).toHaveBeenLastCalledWith({ limit: 400 })
+  })
+
+  it('uses fresh recent metadata when an opened historical session reenters the recent page', async () => {
+    const historical = makeSession('history-updated', '2025-01-01T00:00:00.000Z')
+    useSessionStore.getState().openHistoricalSession(historical)
+    const refreshed = { ...historical, title: 'Updated elsewhere', permissionMode: 'plan' }
+    listMock.mockResolvedValue({ sessions: [refreshed], total: 1 })
+
+    await useSessionStore.getState().fetchSessions()
+    useTabStore.getState().closeTab(historical.id)
+    await useSessionStore.getState().fetchSessions()
+
+    expect(useSessionStore.getState().sessions).toEqual([refreshed])
+    expect(useSessionStore.getState().historicalSessionIds).toEqual(new Set())
+  })
+
+  it.each(['single', 'batch'] as const)('does not resurrect deleted history from a pending refresh after %s deletion', async (deletion) => {
+    const historical = makeSession(`history-deleted-${deletion}`, '2025-01-01T00:00:00.000Z')
+    const pending = createDeferred<{ sessions: ReturnType<typeof makeSession>[]; total: number }>()
+    listMock.mockReturnValueOnce(pending.promise).mockResolvedValue({ sessions: [], total: 0 })
+    deleteMock.mockResolvedValue({ ok: true })
+    batchDeleteMock.mockResolvedValue({ ok: true, successes: [historical.id], failures: [] })
+    useSessionStore.getState().openHistoricalSession(historical)
+    const refresh = useSessionStore.getState().fetchSessions()
+
+    if (deletion === 'single') await useSessionStore.getState().deleteSession(historical.id)
+    else await useSessionStore.getState().deleteSessions([historical.id])
+    pending.resolve({ sessions: [historical], total: 1 })
+    await refresh
+
+    expect(useSessionStore.getState().sessions).toEqual([])
+    expect(useSessionStore.getState().historicalSessionIds).toEqual(new Set())
+    expect(useSessionStore.getState().isLoading).toBe(false)
+    await useSessionStore.getState().fetchSessions()
+    expect(useSessionStore.getState().sessions).toEqual([])
+  })
+
   it('requests a large default session page for noisy history directories', async () => {
     listMock.mockResolvedValue({
       sessions: [makeSession('session-newest', '2026-05-07T00:00:03.000Z')],

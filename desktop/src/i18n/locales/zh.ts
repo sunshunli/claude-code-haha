@@ -1,6 +1,14 @@
 import type { TranslationKey } from './en'
 
 export const zh: Record<TranslationKey, string> = {
+  'sessionHistory.title': '全部历史会话',
+  'sessionHistory.description': '按最近活动时间浏览所有日期、所有项目的会话，每页最多 50 条。',
+  'sessionHistory.newest': '最新',
+  'sessionHistory.previous': '上一页',
+  'sessionHistory.next': '下一页',
+  'sessionHistory.oldest': '最早',
+  'sessionHistory.range': '第 {start}–{end} 条，共 {total} 条',
+  'sessionHistory.indexBuilding': '历史记录仍在整理中，刷新可查看新加载的会话。',
   // ─── Common ──────────────────────────────────────
   'common.cancel': '取消',
   'common.close': '关闭',
