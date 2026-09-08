@@ -10,6 +10,7 @@
  */
 
 import { getOpenAIPolicyError } from '../../services/openaiAuth/policyError.js'
+import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.js'
 import { createGunzip, createInflate } from 'node:zlib'
 
 import { ProviderService } from '../services/providerService.js'
@@ -442,7 +443,7 @@ async function handleAnthropicCompatible(
   traceContext: ProxyTraceContext | null,
 ): Promise<Response> {
   const transformed = hoistToolResultMediaForCompatibility(body)
-  const url = `${baseUrl}/v1/messages`
+  const url = `${normalizeAnthropicBaseUrl(baseUrl)}/v1/messages`
   const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
 
   const headers: Record<string, string> = {

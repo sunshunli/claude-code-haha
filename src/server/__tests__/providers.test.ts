@@ -2415,6 +2415,76 @@ describe('ProviderService', () => {
   })
 
   describe('testProviderConfig', () => {
+    for (const [basePath, messagePath] of [
+      ['', '/v1/messages'],
+      ['/', '/v1/messages'],
+      ['/v1', '/v1/messages'],
+      ['/v1///', '/v1/messages'],
+      ['/anthropic', '/anthropic/v1/messages'],
+      ['/anthropic/v1/', '/anthropic/v1/messages'],
+      ['/v1/tenant', '/v1/tenant/v1/messages'],
+    ]) {
+      test(`Anthropic base URL ${basePath || '(root)'} works in connectivity and proxy requests (#1279)`, async () => {
+        const requests: Array<{ path: string; apiKey: string | null; version: string | null }> = []
+        const server = Bun.serve({
+          hostname: '127.0.0.1',
+          port: 0,
+          async fetch(req) {
+            const requestPath = new URL(req.url).pathname
+            requests.push({
+              path: requestPath,
+              apiKey: req.headers.get('x-api-key'),
+              version: req.headers.get('anthropic-version'),
+            })
+            if (requestPath !== messagePath) {
+              return Response.json({ error: { message: 'Unknown endpoint' } }, { status: 404 })
+            }
+            const body = await req.json() as { stream?: boolean }
+            if (body.stream) {
+              return new Response('event: message_stop\ndata: {"type":"message_stop"}\n\n', {
+                headers: { 'Content-Type': 'text/event-stream' },
+              })
+            }
+            return Response.json({ type: 'message', model: 'model-main', content: [{ type: 'text', text: 'ok' }] })
+          },
+        })
+
+        try {
+          const svc = new ProviderService()
+          const baseUrl = `http://127.0.0.1:${server.port}${basePath}`
+          const provider = await svc.addProvider(sampleInput({
+            baseUrl,
+            authStrategy: 'api_key',
+            supportsNestedToolResultMedia: false,
+          }))
+          const result = await svc.testProvider(provider.id)
+          expect(requests[0]?.path).toBe(messagePath)
+          expect(result.connectivity.success).toBe(true)
+          expect(result.proxy?.success).toBe(true)
+
+          for (const stream of [false, true]) {
+            const req = new Request(`http://localhost/proxy/providers/${provider.id}/v1/messages`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
+              body: JSON.stringify({ model: 'model-main', max_tokens: 16, stream, messages: [{ role: 'user', content: 'hello' }] }),
+            })
+            const response = await handleProxyRequest(req, new URL(req.url))
+            expect(response.status).toBe(200)
+            if (stream) expect(await response.text()).toContain('event: message_stop')
+            else expect(await response.json()).toMatchObject({ type: 'message' })
+          }
+          expect(requests).toEqual(Array.from({ length: 4 }, () => ({
+            path: messagePath,
+            apiKey: 'sk-test-key-123',
+            version: '2023-06-01',
+          })))
+          expect((await svc.getProvider(provider.id))?.baseUrl).toBe(baseUrl)
+        } finally {
+          server.stop(true)
+        }
+      })
+    }
+
     test('should use auth strategy headers for Anthropic-compatible tests', async () => {
       const originalFetch = globalThis.fetch
       const calls: Array<{ url: string; headers: Record<string, string> }> = []

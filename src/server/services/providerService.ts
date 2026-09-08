@@ -10,6 +10,7 @@ import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
 import { ApiError } from '../middleware/errorHandler.js'
+import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.js'
 import { readRecoverableJsonFile } from './recoverableJsonFile.js'
 import { ManagedSettingsService } from './managedSettingsService.js'
 import { anthropicToOpenaiChat } from '../proxy/transform/anthropicToOpenaiChat.js'
@@ -757,7 +758,7 @@ export class ProviderService {
         headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }
       } else {
         transformedBody = hoistToolResultMediaForCompatibility(anthropicReq)
-        upstreamUrl = `${base}/v1/messages`
+        upstreamUrl = `${normalizeAnthropicBaseUrl(base)}/v1/messages`
         headers = {
           'Content-Type': 'application/json',
           'anthropic-version': '2023-06-01',
@@ -836,7 +837,7 @@ function buildDirectTestRequest(
   }
   // anthropic
   return {
-    url: `${base}/v1/messages`,
+    url: `${normalizeAnthropicBaseUrl(base)}/v1/messages`,
     headers: {
       'Content-Type': 'application/json',
       'anthropic-version': '2023-06-01',
