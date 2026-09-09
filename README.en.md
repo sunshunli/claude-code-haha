@@ -1,276 +1,187 @@
 # Claude Code Haha
 
-<p align="right"><a href="./README.md">中文</a> | <strong>English</strong></p>
-
-A **locally runnable version** repaired from the leaked Claude Code source, with support for any Anthropic-compatible API endpoint such as MiniMax and OpenRouter.
-
-> The original leaked source does not run as-is. This repository fixes multiple blocking issues in the startup path so the full Ink TUI can work locally.
-
 <p align="center">
-  <img src="docs/00runtime.png" alt="Runtime screenshot" width="800">
+  <img src="docs/images/readme-cover-en.jpg" alt="cc-haha — Open-source desktop for Claude Code" width="960">
 </p>
 
-## Table of Contents
+<div align="center">
 
-- [Features](#features)
-- [Architecture Overview](#architecture-overview)
-- [Quick Start](#quick-start)
-- [Environment Variables](#environment-variables)
-- [Fallback Mode](#fallback-mode)
-- [Computer Use Desktop Control](#computer-use-desktop-control)
-- [FAQ](#faq)
-- [Fixes Compared with the Original Leaked Source](#fixes-compared-with-the-original-leaked-source)
-- [Project Structure](#project-structure)
-- [Tech Stack](#tech-stack)
+[![GitHub Stars](https://img.shields.io/github/stars/NanmiCoder/cc-haha?style=social)](https://github.com/NanmiCoder/cc-haha/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/NanmiCoder/cc-haha?style=social)](https://github.com/NanmiCoder/cc-haha/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/NanmiCoder/cc-haha)](https://github.com/NanmiCoder/cc-haha/issues)
+[![GitHub Pull Requests](https://img.shields.io/github/issues-pr/NanmiCoder/cc-haha)](https://github.com/NanmiCoder/cc-haha/pulls)
+[![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/NanmiCoder/cc-haha/blob/main/LICENSE)
+[![English](https://img.shields.io/badge/🇺🇸_English-Current-blue)](README.en.md)
+[![中文](https://img.shields.io/badge/🇨🇳_简体中文-Available-green)](README.md)
+[![Docs](https://img.shields.io/badge/📖_Documentation-Visit-FF7A00)](https://cchaha.ai)
 
----
+[简体中文](README.md) · **English**
 
-## Features
+</div>
 
-- Full Ink TUI experience (matching the official Claude Code interface)
-- `--print` headless mode for scripts and CI
-- MCP server, plugin, and Skills support
-- Custom API endpoint and model support ([Third-Party Models Guide](docs/third-party-models.en.md))
-- **Computer Use desktop control** (screenshots, mouse, keyboard, app management) — [Guide](docs/computer-use.en.md)
-- Fallback Recovery CLI mode
+Claude Code Haha is a **desktop Claude Code workspace** for macOS, Windows, and Linux: multi-session workspaces, global search, branch / Worktree launch, diff review, built-in browser preview, GUI permission approval, any model — Claude, ChatGPT, Grok, presets, or local endpoints — image generation, visual MCP & SubAgent managers, an Agent Teams workbench, dynamic Workflow orchestration, model trace, Computer Use, skill marketplace, colour themes, desktop pets, H5 remote access, IM integration, and scheduled tasks, all in one app.
 
-> **Computer Use Note**: This project includes a **modified version of Computer Use**. The official implementation relies on Anthropic's private native modules. We replaced the entire underlying operation layer with a Python bridge (`pyautogui` + `mss` + `pyobjc`), enabling anyone to use Computer Use on macOS. See the [Computer Use Guide](docs/computer-use.en.md) for details.
+<p align="center">
+  <a href="#desktop-preview">Desktop Preview</a> · <a href="#install-the-desktop-app">Install</a> · <a href="#desktop-highlights">Highlights</a> · <a href="#more-documentation">More Docs</a> · <a href="#sponsorship--partnership">Sponsorship</a> · <a href="#user-group">User Group</a>
+</p>
 
 ---
 
-## Architecture Overview
+## Desktop Preview
+
+<p align="center">
+  <a href="https://github.com/NanmiCoder/cc-haha/releases"><img src="https://img.shields.io/badge/⬇_Download_Desktop-macOS_%7C_Windows_%7C_Linux-FF7A00?style=for-the-badge" alt="Download Desktop"></a>
+</p>
 
 <table>
   <tr>
-    <td align="center" width="25%"><img src="docs/01-overall-architecture.png" alt="Overall architecture"><br><b>Overall architecture</b></td>
-    <td align="center" width="25%"><img src="docs/02-request-lifecycle.png" alt="Request lifecycle"><br><b>Request lifecycle</b></td>
-    <td align="center" width="25%"><img src="docs/03-tool-system.png" alt="Tool system"><br><b>Tool system</b></td>
-    <td align="center" width="25%"><img src="docs/04-multi-agent.png" alt="Multi-agent architecture"><br><b>Multi-agent architecture</b></td>
+    <td align="center" width="33.33%"><img src="docs/images/app/en/session-new.webp" alt="Empty desktop session before the first task"><br><b>Start with a clear, empty session</b><br><sub>Project and permissions stay visible</sub></td>
+    <td align="center" width="33.33%"><img src="docs/images/app/en/session-main.webp" alt="Real task running with the Activity panel open"><br><b>Follow the task as it runs</b><br><sub>Tool calls and stage-by-stage progress stay in view</sub></td>
+    <td align="center" width="33.33%"><img src="docs/images/app/en/workspace-diff.webp" alt="Workspace diff review"><br><b>See exactly what changed</b><br><sub>A focused, full-width syntax-highlighted diff</sub></td>
   </tr>
   <tr>
-    <td align="center" width="25%"><img src="docs/05-terminal-ui.png" alt="Terminal UI"><br><b>Terminal UI</b></td>
-    <td align="center" width="25%"><img src="docs/06-permission-security.png" alt="Permissions and security"><br><b>Permissions and security</b></td>
-    <td align="center" width="25%"><img src="docs/07-services-layer.png" alt="Services layer"><br><b>Services layer</b></td>
-    <td align="center" width="25%"><img src="docs/08-state-data-flow.png" alt="State and data flow"><br><b>State and data flow</b></td>
+    <td align="center" width="33.33%"><img src="docs/images/app/en/workspace-preview.webp" alt="Built-in browser previewing the page that was just changed"><br><b>Verify on the spot</b><br><sub>The real edited page in the built-in browser</sub></td>
+    <td align="center" width="33.33%"><img src="docs/images/app/en/model-picker.webp" alt="Model picker showing providers, presets, and local endpoints"><br><b>Choose the exact model</b><br><sub>Your providers, presets, and local endpoints in one list</sub></td>
+    <td align="center" width="33.33%"><img src="docs/images/app/en/skill-market.webp" alt="Skill marketplace"><br><b>Missing a trick? Install it</b><br><sub>Source and safety status shown up front</sub></td>
   </tr>
 </table>
 
 ---
 
-## Quick Start
+## Sponsorship & Partnership
 
-### 1. Install Bun
+This project is maintained in the author's spare time. Corporate or individual sponsorships are welcome to support ongoing development. Custom features, integrations, and business partnerships are also open for discussion.
 
-This project requires [Bun](https://bun.sh). If Bun is not installed on the target machine yet, use one of the following methods first:
+<table>
+  <thead>
+    <tr>
+      <th width="220">Sponsor</th>
+      <th align="left">Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="center" valign="middle">
+        <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=cc-haha">
+          <img src="docs/images/sponsors/atlascloud-logo-black.png#gh-light-mode-only" width="180" alt="Atlas Cloud">
+          <img src="docs/images/sponsors/atlascloud-logo-white.png#gh-dark-mode-only" width="180" alt="Atlas Cloud">
+        </a>
+      </td>
+      <td valign="middle">
+        Thanks to <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=cc-haha">Atlas Cloud</a> for sponsoring this project. Atlas Cloud is a full-modal AI inference platform that gives developers a single AI API to access video generation, image generation, and LLM APIs. Instead of managing multiple vendor integrations, you connect once and get unified access to 300+ curated models across all modalities. Atlas Cloud is already built into the cc-haha provider list, so you can pick it in settings and start using it with just an API key. Check out Atlas Cloud's new <a href="https://www.atlascloud.ai/console/coding-plan">coding plan promotion</a> for more budget-friendly API access.
+      </td>
+    </tr>
+    <tr>
+      <td align="center" valign="middle">
+        <a href="https://www.apismart.ai">
+          <img src="docs/images/sponsors/apismart-logo.png" width="180" alt="ApiSmart">
+        </a>
+      </td>
+      <td valign="middle">
+        Thanks to <a href="https://www.apismart.ai">ApiSmart</a> for sponsoring this project. ApiSmart provides unified access to leading AI models through a single API. Use one API key to connect with LLM, image, and video models through an OpenAI-compatible interface. Easily switch between models, simplify billing, and improve reliability with intelligent routing and automatic failover.
+      </td>
+    </tr>
+  </tbody>
+</table>
 
-```bash
-# macOS / Linux (official install script)
-curl -fsSL https://bun.sh/install | bash
-```
+📧 **Contact**: relakkes@gmail.com
 
-If a minimal Linux image reports `unzip is required to install bun`, install `unzip` first:
+---
 
-```bash
-# Ubuntu / Debian
-apt update && apt install -y unzip
-```
+## Install the Desktop App
 
-```bash
-# macOS (Homebrew)
-brew install bun
-```
+1. Download the macOS / Windows / Linux desktop installer from [Releases](https://github.com/NanmiCoder/cc-haha/releases).
+2. On first launch, configure your model provider, API key, and default model in Settings.
+3. Public macOS releases require signing and notarization. Draft or unsigned temporary builds may still need one-time manual approval. Unsigned Windows installers may show SmartScreen; click "More info" -> "Run anyway". See the [desktop installation guide](docs/en/start/install.md).
 
-```powershell
-# Windows (PowerShell)
-powershell -c "irm bun.sh/install.ps1 | iex"
-```
+Release trust and privacy: [Code signing policy](docs/en/start/code-signing.md) · [Privacy and network access](docs/en/start/privacy.md)
 
-After installation, reopen the terminal and verify:
+## Run the CLI from Source
 
-```bash
-bun --version
-```
-
-### 2. Install project dependencies
+For users who want to debug the underlying CLI, server, or local development flow:
 
 ```bash
 bun install
-```
-
-### 3. Configure environment variables
-
-Copy the example file and fill in your API key:
-
-```bash
 cp .env.example .env
-```
-
-Edit `.env` (the example below uses [MiniMax](https://platform.minimaxi.com/subscribe/token-plan?code=1TG2Cseab2&source=link) as the API provider — you can replace it with any compatible service):
-
-```env
-# API authentication (choose one)
-ANTHROPIC_API_KEY=sk-xxx          # Standard API key via x-api-key header
-ANTHROPIC_AUTH_TOKEN=sk-xxx       # Bearer token via Authorization header
-
-# API endpoint (optional, defaults to Anthropic)
-ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
-
-# Model configuration
-ANTHROPIC_MODEL=MiniMax-M2.7-highspeed
-ANTHROPIC_DEFAULT_SONNET_MODEL=MiniMax-M2.7-highspeed
-ANTHROPIC_DEFAULT_HAIKU_MODEL=MiniMax-M2.7-highspeed
-ANTHROPIC_DEFAULT_OPUS_MODEL=MiniMax-M2.7-highspeed
-
-# Timeout in milliseconds
-API_TIMEOUT_MS=3000000
-
-# Disable telemetry and non-essential network traffic
-DISABLE_TELEMETRY=1
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-```
-
-> **Tip**: You can also configure environment variables via the `env` field in `~/.claude/settings.json`. This is consistent with the official Claude Code configuration:
->
-> ```json
-> {
->   "env": {
->     "ANTHROPIC_AUTH_TOKEN": "sk-xxx",
->     "ANTHROPIC_BASE_URL": "https://api.minimaxi.com/anthropic",
->     "ANTHROPIC_MODEL": "MiniMax-M2.7-highspeed"
->   }
-> }
-> ```
->
-> Priority: Environment variables > `.env` file > `~/.claude/settings.json`
-
-### 4. Start
-
-#### macOS / Linux
-
-```bash
-# Interactive TUI mode (full interface)
-./bin/claude-haha
-
-# Headless mode (single prompt)
-./bin/claude-haha -p "your prompt here"
-
-# Pipe input
-echo "explain this code" | ./bin/claude-haha -p
-
-# Show all options
-./bin/claude-haha --help
-```
-
-#### Windows
-
-> **Prerequisite**: [Git for Windows](https://git-scm.com/download/win) must be installed (provides Git Bash, which the project's internal shell execution depends on).
-
-The startup script `bin/claude-haha` is a bash script and cannot run directly in cmd or PowerShell. Use one of the following methods:
-
-**Option 1: PowerShell / cmd — call Bun directly (recommended)**
-
-```powershell
-# Interactive TUI mode
-bun --env-file=.env ./src/entrypoints/cli.tsx
-
-# Headless mode
-bun --env-file=.env ./src/entrypoints/cli.tsx -p "your prompt here"
-
-# Fallback Recovery CLI
-bun --env-file=.env ./src/localRecoveryCli.ts
-```
-
-**Option 2: Run inside Git Bash**
-
-```bash
-# Same usage as macOS / Linux
 ./bin/claude-haha
 ```
 
-> **Note**: Some features (voice input, Computer Use, sandbox isolation, etc.) are not available on Windows. This does not affect the core TUI interaction.
+See [environment variables](docs/en/cli/env.md) and [CLI setup](docs/en/cli/index.md) for more configuration options.
 
 ---
 
-## Environment Variables
+## Desktop Highlights
 
-| Variable | Required | Description |
-|------|------|------|
-| `ANTHROPIC_API_KEY` | One of two | API key sent via the `x-api-key` header |
-| `ANTHROPIC_AUTH_TOKEN` | One of two | Auth token sent via the `Authorization: Bearer` header |
-| `ANTHROPIC_BASE_URL` | No | Custom API endpoint, defaults to Anthropic |
-| `ANTHROPIC_MODEL` | No | Default model |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | No | Sonnet-tier model mapping |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | No | Haiku-tier model mapping |
-| `ANTHROPIC_DEFAULT_OPUS_MODEL` | No | Opus-tier model mapping |
-| `API_TIMEOUT_MS` | No | API request timeout, default `600000` (10min) |
-| `DISABLE_TELEMETRY` | No | Set to `1` to disable telemetry |
-| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | No | Set to `1` to disable non-essential network traffic |
-
----
-
-## Fallback Mode
-
-If the full TUI has issues, use the simplified readline-based interaction mode:
-
-```bash
-CLAUDE_CODE_FORCE_RECOVERY_CLI=1 ./bin/claude-haha
-```
-
----
-
-## Computer Use Desktop Control
-
-This project enables and modifies Claude Code's Computer Use feature (internal codename "Chicago"), allowing AI models to directly control your macOS desktop — screenshots, mouse clicks, keyboard input, app management.
-
-**Underlying modification**: The official implementation depends on Anthropic's private native modules (`@ant/computer-use-swift`, `@ant/computer-use-input`). This project replaces them entirely with a Python bridge using `pyautogui` (mouse/keyboard), `mss` (screenshots), and `pyobjc` (macOS APIs) — no closed-source binaries required.
-
-```bash
-# Ensure Python 3 and macOS Accessibility/Screen Recording permissions, then:
-./bin/claude-haha
-> Take a screenshot
-> Open Safari and search for something
-```
-
-For supported platforms, technical architecture, and approaches we tried, see: **[Computer Use Guide](docs/computer-use.en.md)**
+- **Multi-session workspace**: tabs, project switching, terminal entry, and session history in one place, with a resizable sidebar.
+- **Global search**: press Cmd+K to search across every session and jump to the match.
+- **Branch / Worktree launch**: choose a repository branch and decide whether to use the current working tree or an isolated Worktree.
+- **Review edits file by file**: the workspace lists this turn's changes; open any file for a syntax-highlighted diff, or undo the whole turn.
+- **Built-in browser preview**: the page your agent just edited renders right inside the app, cookies and login state included.
+- **Five permission modes**: from "ask every time" to "skip permissions" — risky commands, tool calls, and follow-up questions are all approved in the GUI.
+- **Bring your own model**: sign in to Claude, ChatGPT, or Grok; use presets for DeepSeek, Kimi, Zhipu GLM and others; or point it at LM Studio and Ollama running locally.
+- **Image generation**: generate and edit images right in the chat — sign in with ChatGPT or Grok for instant use, or plug in any OpenAI-compatible Images API.
+- **Visual MCP manager**: add and edit MCP servers in a GUI — STDIO / Streamable HTTP / SSE, with project, shared, or global scope.
+- **Six colour themes**: white, paper, warm classic, celadon, ink night, and ink blue — optionally following your system's light/dark setting.
+- **Skill marketplace**: discover, preview, and install third-party skills from ClawHub / SkillHub, with source and safety status shown up front.
+- **Session activity panel**: track task progress, background tasks, SubAgents, and sources in one side panel.
+- **Visual SubAgent manager**: create and tune SubAgents in a GUI — model, tools, and permission mode.
+- **Agent Teams workbench**: visualize multi-agent collaboration in the GUI — members, tasks, a communication feed, and a dependency-lane canvas.
+- **Dynamic Workflow orchestration**: the model writes and runs orchestration scripts on the fly, driving subagents concurrently or in pipelines, with phase views, interrupts, and resume.
+- **Model trace**: every model request is logged locally with status and timing — search and filter to diagnose stuck or failed calls.
+- **Computer Use**: let the agent take screenshots, click, type, and control desktop apps after authorization.
+- **Desktop pets**: Dada, Huhu, Bubu, and Huihui change what they do with the task at hand — or raise one of your own (off by default).
+- **H5 remote access**: scan a QR code to continue the session in your phone browser; locking the screen won't kill a running task.
+- **IM integration**: chat, switch projects, and approve actions through Telegram / Feishu / WeChat / DingTalk / WhatsApp.
+- **Scheduled tasks and usage stats**: run planned tasks in their own sessions and track local token usage trends.
 
 ---
 
-## Fixes Compared with the Original Leaked Source
+## More Documentation
 
-The leaked source could not run directly. This repository mainly fixes the following issues:
+Full documentation site: <https://cchaha.ai>
 
-| Issue | Root cause | Fix |
-|------|------|------|
-| TUI does not start | The entry script routed no-argument startup to the recovery CLI | Restored the full `cli.tsx` entry |
-| Startup hangs | The `verify` skill imports a missing `.md` file, causing Bun's text loader to hang indefinitely | Added stub `.md` files |
-| `--print` hangs | `filePersistence/types.ts` was missing | Added type stub files |
-| `--print` hangs | `ultraplan/prompt.txt` was missing | Added resource stub files |
-| **Enter key does nothing** | The `modifiers-napi` native package was missing, `isModifierPressed()` threw, `handleEnter` was interrupted, and `onSubmit` never ran | Added try/catch fault tolerance |
-| Setup was skipped | `preload.ts` automatically set `LOCAL_RECOVERY=1`, skipping all initialization | Removed the default setting |
+| Section | Documents |
+|------|------|
+| **Getting started** | [What this is](docs/en/start/index.md) · [Download and install](docs/en/start/install.md) · [Connect a model provider](docs/en/start/models.md) · [Your first session](docs/en/start/first-session.md) · [Troubleshooting](docs/en/start/troubleshooting.md) |
+| **Desktop features** | [Feature overview](docs/en/desktop/index.md) · [Computer Use](docs/en/desktop/computer-use.md) · [Desktop pets](docs/en/desktop/pets.md) · [Phone H5 and IM relay](docs/en/desktop/remote.md) |
+| **IM integrations** | [Overview and pairing](docs/en/im/index.md) · [Feishu](docs/en/im/feishu.md) · [Telegram](docs/en/im/telegram.md) · [WeChat](docs/en/im/wechat.md) · [DingTalk](docs/en/im/dingtalk.md) · [WhatsApp](docs/en/im/whatsapp.md) |
+| **CLI** | [Install and run](docs/en/cli/index.md) · [Command reference](docs/en/cli/reference.md) · [Environment variables](docs/en/cli/env.md) |
+| **Internals** | [Desktop architecture](docs/en/internals/desktop.md) · [Multi-agent system](docs/en/internals/agent.md) · [Skills system](docs/en/internals/skills.md) · [Memory system](docs/en/internals/memory.md) · [Computer Use architecture](docs/en/internals/computer-use.md) · [Local server and API](docs/en/internals/server.md) · [Channel system](docs/en/internals/channel.md) · [Project structure](docs/en/internals/structure.md) · [Contributing and quality gates](docs/en/internals/contributing.md) |
 
 ---
 
-## Project Structure
+## ☕ Buy Me a Coffee
 
-```text
-bin/claude-haha          # Entry script
-preload.ts               # Bun preload (sets MACRO globals)
-.env.example             # Environment variable template
-src/
-├── entrypoints/cli.tsx  # Main CLI entry
-├── main.tsx             # Main TUI logic (Commander.js + React/Ink)
-├── localRecoveryCli.ts  # Fallback Recovery CLI
-├── setup.ts             # Startup initialization
-├── screens/REPL.tsx     # Interactive REPL screen
-├── ink/                 # Ink terminal rendering engine
-├── components/          # UI components
-├── tools/               # Agent tools (Bash, Edit, Grep, etc.)
-├── commands/            # Slash commands (/commit, /review, etc.)
-├── skills/              # Skill system
-├── services/            # Service layer (API, MCP, OAuth, etc.)
-├── hooks/               # React hooks
-└── utils/               # Utility functions
-```
+If this project helps you, consider buying me a coffee — every bit of support keeps this project going ❤️
+
+<table>
+<tr>
+<td align="center" width="33%">
+<img src="docs/images/donate/wechat_pay.jpeg" width="250" alt="WeChat Pay"><br>
+<b>WeChat Pay</b>
+</td>
+<td align="center" width="33%">
+<img src="docs/images/donate/zfb_pay.png" width="250" alt="Alipay"><br>
+<b>Alipay</b>
+</td>
+<td align="center" width="33%">
+<a href="https://buymeacoffee.com/relakkes" target="_blank">
+<img src="docs/images/donate/bmc_button.png" width="250" alt="Buy Me a Coffee">
+</a><br>
+<b>Buy Me a Coffee</b>
+</td>
+</tr>
+</table>
+
+---
+
+## User Group
+
+Scan the QR code below to join the cc-haha user group on WeCom (WeChat Work) — the conversation there is mostly in Chinese. For questions and bug reports in English, [Issues](https://github.com/NanmiCoder/cc-haha/issues) is the better place. For enterprise deployment, customization, or Agent development needs, contact the author [NanmiCoder](https://github.com/NanmiCoder).
+
+<p align="center">
+  <img src="docs/images/community/wechat-group-qr.png" width="300" alt="cc-haha WeCom user group QR code">
+</p>
 
 ---
 
@@ -278,51 +189,30 @@ src/
 
 | Category | Technology |
 |------|------|
-| Runtime | [Bun](https://bun.sh) |
 | Language | TypeScript |
+| Desktop app | Electron |
+| Desktop UI | React + Vite |
+| Local runtime | [Bun](https://bun.sh) |
 | Terminal UI | React + [Ink](https://github.com/vadimdemedes/ink) |
 | CLI parsing | Commander.js |
 | API | Anthropic SDK |
 | Protocols | MCP, LSP |
 
----
+## Acknowledgements
 
-## FAQ
+Thanks to the following open-source projects and community practices for reference and inspiration:
 
-### Q: `undefined is not an object (evaluating 'usage.input_tokens')`
-
-**Cause**: `ANTHROPIC_BASE_URL` is misconfigured. The API endpoint is returning HTML or another non-JSON format instead of a valid Anthropic protocol response.
-
-This project uses the **Anthropic Messages API protocol**. `ANTHROPIC_BASE_URL` must point to an endpoint compatible with Anthropic's `/v1/messages` interface. The Anthropic SDK automatically appends `/v1/messages` to the base URL, so:
-
-- MiniMax: `ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic` ✅
-- OpenRouter: `ANTHROPIC_BASE_URL=https://openrouter.ai/api` ✅
-- OpenRouter (wrong): `ANTHROPIC_BASE_URL=https://openrouter.ai/anthropic` ❌ (returns HTML)
-
-If your model provider only supports the OpenAI protocol, you need a proxy like LiteLLM for protocol translation. See the [Third-Party Models Guide](docs/third-party-models.en.md).
-
-### Q: `Cannot find package 'bundle'`
-
-```
-error: Cannot find package 'bundle' from '.../claude-code-haha/src/entrypoints/cli.tsx'
-```
-
-**Cause**: Your Bun version is too old and doesn't support the required `bun:bundle` built-in module.
-
-**Fix**: Upgrade Bun to the latest version:
-
-```bash
-bun upgrade
-```
-
-### Q: How to use OpenAI / DeepSeek / Ollama or other non-Anthropic models?
-
-This project only supports the Anthropic protocol. If your model provider doesn't natively support the Anthropic protocol, you need a proxy like [LiteLLM](https://github.com/BerriAI/litellm) for protocol translation (OpenAI → Anthropic).
-
-See the [Third-Party Models Guide](docs/third-party-models.en.md) for detailed setup instructions.
+- [React](https://github.com/facebook/react): frontend engineering and component-based UI ecosystem.
+- [Electron](https://github.com/electron/electron): cross-platform desktop app capabilities and engineering practices.
+- [cc-switch](https://github.com/farion1231/cc-switch): reference for model provider configuration.
+- [LINUX DO](https://linux.do/): a new ideal developer community.
 
 ---
 
-## Disclaimer
+## ⭐ Star History
 
-This repository is based on the Claude Code source leaked from the Anthropic npm registry on 2026-03-31. All original source code copyrights belong to [Anthropic](https://www.anthropic.com). It is provided for learning and research purposes only.
+If this project helps you, please support it with a ⭐ Star so more people can discover Claude Code Haha.
+
+<a href="https://www.repostars.dev/?repos=NanmiCoder%2Fcc-haha&theme=ocean">
+  <img alt="Star History Chart" src="https://www.repostars.dev/api/embed?repo=NanmiCoder%2Fcc-haha&theme=ocean" />
+</a>

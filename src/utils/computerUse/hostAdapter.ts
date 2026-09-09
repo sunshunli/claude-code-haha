@@ -7,7 +7,11 @@ import { logForDebugging } from '../debug.js'
 import { COMPUTER_USE_MCP_SERVER_NAME } from './common.js'
 import { createCliExecutor } from './executor.js'
 import { getChicagoEnabled, getChicagoSubGates } from './gates.js'
-import { callPythonHelper } from './pythonBridge.js'
+import { normalizeOsPermissions } from './permissions.js'
+// Platform-routed helper: macOS → native cu-helper, Windows → Python helper.
+import { callHelper } from './helperBridge.js'
+import { maybeShowNativePermissionCard } from './nativePermissionCard.js'
+import { ComputerUseRepl } from './replRuntime.js'
 
 class DebugLogger implements Logger {
   silly(message: string, ...args: unknown[]): void {
@@ -34,15 +38,23 @@ export function getComputerUseHostAdapter(): ComputerUseHostAdapter {
   cached = {
     serverName: COMPUTER_USE_MCP_SERVER_NAME,
     logger: new DebugLogger(),
+    createReplRuntime: () => new ComputerUseRepl(),
     executor: createCliExecutor({
       getMouseAnimationEnabled: () => getChicagoSubGates().mouseAnimation,
       getHideBeforeActionEnabled: () => getChicagoSubGates().hideBeforeAction,
     }),
     ensureOsPermissions: async () => {
-      const perms = await callPythonHelper<{ accessibility: boolean; screenRecording: boolean }>('check_permissions', {})
-      return perms.accessibility && perms.screenRecording
-        ? { granted: true as const }
-        : { granted: false as const, accessibility: perms.accessibility, screenRecording: perms.screenRecording }
+      const rawPerms = await callHelper<{ accessibility: boolean; screenRecording: boolean | null }>('check_permissions', {})
+      const perms = normalizeOsPermissions(rawPerms)
+      if (perms.granted) return { granted: true as const }
+      // Missing a TCC grant → pop the native, guided permission card (macOS).
+      // Fire-and-forget + debounced; spawned from this same CLI process so it
+      // grants the very cu-helper binary that runs injection/capture.
+      maybeShowNativePermissionCard({
+        accessibility: perms.accessibility,
+        screenRecording: perms.screenRecording,
+      })
+      return { granted: false as const, accessibility: perms.accessibility, screenRecording: perms.screenRecording }
     },
     isDisabled: () => !getChicagoEnabled(),
     getSubGates: getChicagoSubGates,

@@ -10,6 +10,7 @@ import { getModelBetas } from '../utils/betas.js'
 import { getVertexRegionForModel, isEnvTruthy } from '../utils/envUtils.js'
 import { logError } from '../utils/log.js'
 import { normalizeAttachmentForAPI } from '../utils/messages.js'
+import { parseOpenAIReasoningEnvelope } from '../utils/openAIReasoningEnvelope.js'
 import {
   createBedrockRuntimeClient,
   getInferenceProfileBackingModel,
@@ -241,6 +242,24 @@ export function roughTokenCountEstimationForFileType(
   )
 }
 
+export function roughTokenCountEstimationForAPIRequest(
+  messages: readonly {
+    role?: string
+    content?: string | Array<Anthropic.ContentBlock> | Array<Anthropic.ContentBlockParam>
+  }[],
+  tools: readonly unknown[] = [],
+): number {
+  let totalTokens = 0
+  for (const message of messages) {
+    totalTokens += roughTokenCountEstimation(message.role ?? '')
+    totalTokens += roughTokenCountEstimationForContent(message.content)
+  }
+  if (tools.length > 0) {
+    totalTokens += roughTokenCountEstimation(jsonStringify({ tools }))
+  }
+  return totalTokens
+}
+
 /**
  * Estimates token count for a Message object by extracting and analyzing its text content.
  * This provides a more reliable estimate than getTokenUsage for messages that may have been compacted.
@@ -368,7 +387,7 @@ export function roughTokenCountEstimationForMessage(message: {
   return 0
 }
 
-function roughTokenCountEstimationForContent(
+export function roughTokenCountEstimationForContent(
   content:
     | string
     | Array<Anthropic.ContentBlock>
@@ -425,6 +444,12 @@ function roughTokenCountEstimationForBlock(
     return roughTokenCountEstimation(block.thinking)
   }
   if (block.type === 'redacted_thinking') {
+    const openAIReasoning = parseOpenAIReasoningEnvelope(block.data)
+    if (openAIReasoning) {
+      return roughTokenCountEstimation(
+        openAIReasoning.summary.map(entry => entry.text).join('\n'),
+      )
+    }
     return roughTokenCountEstimation(block.data)
   }
   // server_tool_use, web_search_tool_result, mcp_tool_use, etc. —

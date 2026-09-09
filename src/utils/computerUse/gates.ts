@@ -1,6 +1,7 @@
 import type { CoordinateMode, CuSubGates } from '../../vendor/computer-use-mcp/types.js'
 
 import { getDynamicConfig_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
+import { isEnvDefinedFalsy } from '../envUtils.js'
 
 type ChicagoConfig = CuSubGates & {
   enabled: boolean
@@ -32,7 +33,24 @@ function readConfig(): ChicagoConfig {
 }
 
 export function getChicagoEnabled(): boolean {
+  if (isEnvDefinedFalsy(process.env.CLAUDE_COMPUTER_USE_ENABLED)) {
+    return false
+  }
+
   return true
+}
+
+/**
+ * Computer Use is native-only on macOS and compatibility-only on Windows.
+ * The macOS MCP must not be exposed until the exact helper that status/API
+ * calls use is launchable; otherwise the model sees tools that can only fail.
+ */
+export function shouldExposeComputerUseMcp(
+  platform: NodeJS.Platform,
+  macosNativeLaunchable: boolean,
+): boolean {
+  return platform === 'win32'
+    || (platform === 'darwin' && macosNativeLaunchable)
 }
 
 export function getChicagoSubGates(): CuSubGates {

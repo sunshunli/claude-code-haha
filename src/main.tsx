@@ -52,6 +52,7 @@ import { getSubscriptionType, isClaudeAISubscriber, prefetchAwsCredentialsAndBed
 import { checkHasTrustDialogAccepted, getGlobalConfig, getRemoteControlAtStartup, isAutoUpdaterDisabled, saveGlobalConfig } from './utils/config.js';
 import { seedEarlyInput, stopCapturingEarlyInput } from './utils/earlyInput.js';
 import { getInitialEffortSetting, parseEffortValue } from './utils/effort.js';
+import { ULTRACODE_EFFORT_ARG, ULTRACODE_EFFORT_LEVEL } from './utils/workflows/ultracode.js';
 import { getInitialFastModeSetting, isFastModeEnabled, prefetchFastModeStatus, resolveFastModeStatusFromCache } from './utils/fastMode.js';
 import { applyConfigEnvironmentVariables } from './utils/managedEnv.js';
 import { createSystemMessage, createUserMessage } from './utils/messages.js';
@@ -86,6 +87,7 @@ import { type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS, logEve
 import { initializeAnalyticsGates } from 'src/services/analytics/sink.js';
 import { getOriginalCwd, setAdditionalDirectoriesForClaudeMd, setIsRemoteMode, setMainLoopModelOverride, setMainThreadAgentType, setTeleportedSessionInfo } from './bootstrap/state.js';
 import { filterCommandsForRemoteMode, getCommands } from './commands.js';
+import { filterCommandsForHeadlessMode } from './commands/headless.js';
 import type { StatsStore } from './context/stats.js';
 import { launchAssistantInstallWizard, launchAssistantSessionChooser, launchInvalidSettingsDialog, launchResumeChooser, launchSnapshotUpdateDialog, launchTeleportRepoMismatchDialog, launchTeleportResumeWrapper } from './dialogLaunchers.js';
 import { SHOW_CURSOR } from './ink/termio/dec.js';
@@ -990,11 +992,16 @@ async function run(): Promise<CommanderCommand> {
     return Number.isFinite(n) ? n : undefined;
   }).hideHelp()).option('--from-pr [value]', 'Resume a session linked to a PR by PR number/URL, or open interactive picker with optional search term', value => value || true).option('--no-session-persistence', 'Disable session persistence - sessions will not be saved to disk and cannot be resumed (only works with --print)').addOption(new Option('--resume-session-at <message id>', 'When resuming, only messages up to and including the assistant message with <message.id> (use with --resume in print mode)').argParser(String).hideHelp()).addOption(new Option('--rewind-files <user-message-id>', 'Restore files to state at the specified user message and exit (requires --resume)').hideHelp())
   // @[MODEL LAUNCH]: Update the example model ID in the --model help text.
-  .option('--model <model>', `Model for the current session. Provide an alias for the latest model (e.g. 'sonnet' or 'opus') or a model's full name (e.g. 'claude-sonnet-4-6').`).addOption(new Option('--effort <level>', `Effort level for the current session (low, medium, high, max)`).argParser((rawValue: string) => {
-    const value = rawValue.toLowerCase();
-    const allowed = ['low', 'medium', 'high', 'max'];
-    if (!allowed.includes(value)) {
-      throw new InvalidArgumentError(`It must be one of: ${allowed.join(', ')}`);
+  .option('--model <model>', `Model for the current session. Provide an alias for the latest model (e.g. 'sonnet' or 'opus') or a model's full name (e.g. 'claude-sonnet-4-6').`).addOption(new Option('--effort <level>', `Effort level for the current session (low, medium, high, xhigh, max, ultracode, or an integer)`).argParser((rawValue: string) => {
+    // `ultracode` is passed through as-is: it is not an effort level but a
+    // request for xhigh plus standing workflow orchestration, resolved later
+    // where the session's model and workflow availability are known.
+    if (rawValue.toLowerCase() === ULTRACODE_EFFORT_ARG) {
+      return ULTRACODE_EFFORT_ARG;
+    }
+    const value = parseEffortValue(rawValue);
+    if (value === undefined) {
+      throw new InvalidArgumentError('It must be one of: low, medium, high, xhigh, max, ultracode, or an integer');
     }
     return value;
   })).option('--agent <agent>', `Agent for the current session. Overrides the 'agent' setting.`).option('--betas <betas...>', 'Beta headers to include in API requests (API key users only)').option('--fallback-model <model>', 'Enable automatic fallback to specified model when default model is overloaded (only works with --print)').addOption(new Option('--workload <tag>', 'Workload tag for billing-header attribution (cc_workload). Process-scoped; set by SDK daemon callers that spawn subprocesses for cron work. (only works with --print)').hideHelp()).option('--settings <file-or-json>', 'Path to a settings JSON file or a JSON string to load additional settings from').option('--add-dir <directories...>', 'Additional directories to allow tool access to').option('--ide', 'Automatically connect to IDE on startup if exactly one valid IDE is available', () => true).option('--strict-mcp-config', 'Only use MCP servers from --mcp-config, ignoring all other MCP configurations', () => true).option('--session-id <uuid>', 'Use a specific session ID for the conversation (must be a valid UUID)').option('-n, --name <name>', 'Set a display name for this session (shown in /resume and terminal title)').option('--agents <json>', 'JSON object defining custom agents (e.g. \'{"reviewer": {"description": "Reviews code", "prompt": "You are a code reviewer"}}\')').option('--setting-sources <sources>', 'Comma-separated list of setting sources to load (user, project, local).')
@@ -1003,7 +1010,7 @@ async function run(): Promise<CommanderCommand> {
   // `mcp` and `add` as paths, then choked on --transport as an unknown
   // top-level option. Single-value + collect accumulator means each
   // --plugin-dir takes exactly one arg; repeat the flag for multiple dirs.
-  .option('--plugin-dir <path>', 'Load plugins from a directory for this session only (repeatable: --plugin-dir A --plugin-dir B)', (val: string, prev: string[]) => [...prev, val], [] as string[]).option('--disable-slash-commands', 'Disable all skills', () => true).option('--chrome', 'Enable Claude in Chrome integration').option('--no-chrome', 'Disable Claude in Chrome integration').option('--file <specs...>', 'File resources to download at startup. Format: file_id:relative_path (e.g., --file file_abc:doc.txt file_def:img.png)').action(async (prompt, options) => {
+  .option('--plugin-dir <path>', 'Load plugins from a directory for this session only (repeatable: --plugin-dir A --plugin-dir B)', (val: string, prev: string[]) => [...prev, val], [] as string[]).option('--disable-slash-commands', 'Disable all skills', () => true).option('--chrome', 'Enable Claude in Chrome integration').option('--no-chrome', 'Disable Claude in Chrome integration').option('--no-computer-use', 'Disable Computer Use MCP for this session').option('--file <specs...>', 'File resources to download at startup. Format: file_id:relative_path (e.g., --file file_abc:doc.txt file_def:img.png)').action(async (prompt, options) => {
     profileCheckpoint('action_handler_start');
 
     // --bare = one-switch minimal mode. Sets SIMPLE so all the existing
@@ -1147,6 +1154,9 @@ async function run(): Promise<CommanderCommand> {
     const worktreeOption = isWorktreeModeEnabled() ? (options as {
       worktree?: boolean | string;
     }).worktree : undefined;
+    const worktreeBaseRef = isWorktreeModeEnabled() ? (options as {
+      worktreeBaseRef?: string;
+    }).worktreeBaseRef : undefined;
     let worktreeName = typeof worktreeOption === 'string' ? worktreeOption : undefined;
     const worktreeEnabled = worktreeOption !== undefined;
 
@@ -1605,24 +1615,35 @@ async function run(): Promise<CommanderCommand> {
     // `type: 'stdio'`. An enterprise-config ant with the GB gate on would
     // otherwise process.exit(1). Chrome has the same latent issue but has
     // shipped without incident; chicago places itself correctly.
-    if (getPlatform() === 'macos' && !getIsNonInteractiveSession()) {
+    if (process.platform === 'darwin' || process.platform === 'win32') {
       try {
         const {
           getChicagoEnabled
         } = await import('src/utils/computerUse/gates.js');
-        if (getChicagoEnabled()) {
+        const computerUseCliEnabled = options.computerUse !== false;
+        if (getChicagoEnabled() && computerUseCliEnabled) {
           const {
-            setupComputerUseMCP
-          } = await import('src/utils/computerUse/setup.js');
-          const {
-            mcpConfig,
-            allowedTools: cuTools
-          } = setupComputerUseMCP();
-          dynamicMcpConfig = {
-            ...dynamicMcpConfig,
-            ...mcpConfig
-          };
-          allowedTools.push(...cuTools);
+            loadStoredComputerUseConfig
+          } = await import('src/utils/computerUse/preauthorizedConfig.js');
+          const computerUseConfig = await loadStoredComputerUseConfig();
+          if (!computerUseConfig.enabled) {
+            logForDebugging('[Computer Use MCP] Skipped: disabled in computer-use-config.json');
+          } else {
+            const {
+              setupComputerUseMCP
+            } = await import('src/utils/computerUse/setup.js');
+            const {
+              mcpConfig,
+              allowedTools: cuTools
+            } = setupComputerUseMCP();
+            dynamicMcpConfig = {
+              ...dynamicMcpConfig,
+              ...mcpConfig
+            };
+            allowedTools.push(...cuTools);
+          }
+        } else if (!computerUseCliEnabled) {
+          logForDebugging('[Computer Use MCP] Skipped: disabled by --no-computer-use');
         }
       } catch (error) {
         logForDebugging(`[Computer Use MCP] Setup failed: ${errorMessage(error)}`);
@@ -1929,7 +1950,7 @@ async function run(): Promise<CommanderCommand> {
       const {
         setup
       } = await import('./setup.js');
-      await setup(preSetupCwd, permissionMode, allowDangerouslySkipPermissions, worktreeEnabled, worktreeName, tmuxEnabled, sessionId ? validateUuid(sessionId) : undefined, worktreePRNumber, messagingSocketPath);
+      await setup(preSetupCwd, permissionMode, allowDangerouslySkipPermissions, worktreeEnabled, worktreeName, tmuxEnabled, sessionId ? validateUuid(sessionId) : undefined, worktreePRNumber, worktreeBaseRef, messagingSocketPath);
     })();
     const commandsPromise = worktreeEnabled ? null : getCommands(preSetupCwd);
     const agentDefsPromise = worktreeEnabled ? null : getAgentDefinitionsWithOverrides(preSetupCwd);
@@ -2115,6 +2136,14 @@ async function run(): Promise<CommanderCommand> {
       effectiveModel = parseUserSpecifiedModel(mainThreadAgentDefinition.model);
     }
     setMainLoopModelOverride(effectiveModel);
+    // An explicit CLI effort remains authoritative. Otherwise a selected
+    // main-thread agent may provide its own effort before falling back to the
+    // session setting.
+    // `--effort ultracode` is not a sixth level: it resolves to xhigh and
+    // raises a separate session flag, so every model-capability check keeps
+    // reasoning about the five real levels.
+    const ultracodeRequested = String(options.effort ?? '').toLowerCase() === ULTRACODE_EFFORT_ARG;
+    const effectiveEffort = ultracodeRequested ? ULTRACODE_EFFORT_LEVEL : parseEffortValue(options.effort) ?? mainThreadAgentDefinition?.effort ?? getInitialEffortSetting();
 
     // Compute resolved model for hooks (use user-specified model at launch)
     setInitialMainLoopModel(getUserSpecifiedModelSetting() || null);
@@ -2625,7 +2654,7 @@ async function run(): Promise<CommanderCommand> {
 
       // Headless mode supports all prompt commands and some local commands
       // If disableSlashCommands is true, return empty array
-      const commandsHeadless = disableSlashCommands ? [] : commands.filter(command => command.type === 'prompt' && !command.disableNonInteractive || command.type === 'local' && command.supportsNonInteractive);
+      const commandsHeadless = disableSlashCommands ? [] : filterCommandsForHeadlessMode(commands);
       const defaultState = getDefaultAppState();
       const headlessInitialState: AppState = {
         ...defaultState,
@@ -2636,7 +2665,8 @@ async function run(): Promise<CommanderCommand> {
           tools: mcpTools
         },
         toolPermissionContext,
-        effortValue: parseEffortValue(options.effort) ?? getInitialEffortSetting(),
+        effortValue: effectiveEffort,
+        ultracode: ultracodeRequested,
         ...(isFastModeEnabled() && {
           fastMode: getInitialFastModeSetting(effectiveModel ?? null)
         }),
@@ -2723,16 +2753,53 @@ async function run(): Promise<CommanderCommand> {
           }));
         }, configs).catch(err => logForDebugging(`[MCP] ${label} connect error: ${err}`));
       };
-      // Await all MCP configs — print mode is often single-turn, so
-      // "late-connecting servers visible next turn" doesn't help. SDK init
-      // message and turn-1 tool list both need configured MCP tools present.
+      const getDesktopMcpStartupTimeoutMs = (): number => {
+        const raw = process.env.CC_HAHA_DESKTOP_AWAIT_MCP_TIMEOUT_MS;
+        if (raw === undefined) return 5_000;
+        const parsed = Number.parseInt(raw, 10);
+        if (!Number.isFinite(parsed) || parsed < 0) return 5_000;
+        return parsed;
+      };
+      const waitForDesktopMcpStartup = async (promise: Promise<void>, label: string): Promise<void> => {
+        const timeoutMs = getDesktopMcpStartupTimeoutMs();
+        if (timeoutMs === 0) return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timedOut = await Promise.race([promise.then(() => false), new Promise<boolean>(resolve => {
+          timer = setTimeout(resolve, timeoutMs, true);
+        })]);
+        if (timer) clearTimeout(timer);
+        if (timedOut) {
+          logForDebugging(`[MCP] ${label} servers not ready after ${timeoutMs}ms — proceeding; background connection continues`);
+        }
+      };
+
+      // Await all MCP configs for regular print-mode sessions — they're
+      // often single-turn, so "late-connecting servers visible next turn"
+      // doesn't help. SDK init message and turn-1 tool list should include
+      // configured MCP tools when running plain `claude -p`.
+      //
+      // Desktop/bridge sessions (`--sdk-url`) are different: the user is
+      // waiting on the first visible assistant token, not a fully populated
+      // MCP inventory. Blocking startup on slow or failing MCP servers (for
+      // example a local `chatlog` HTTP endpoint timing out) makes the whole
+      // chat feel frozen before the first word appears. In that mode we still
+      // kick off the connections immediately, but let them settle in the
+      // background so headlessStore picks them up after the session starts.
+      //
       // Zero-server case is free via the early return in connectMcpBatch.
       // Connectors parallelize inside getMcpToolsCommandsAndResources
       // (processBatched with Promise.all). claude.ai is awaited too — its
       // fetch was kicked off early (line ~2558) so only residual time blocks
       // here. --bare skips claude.ai entirely for perf-sensitive scripts.
       profileCheckpoint('before_connectMcp');
-      await connectMcpBatch(regularMcpConfigs, 'regular');
+      const regularMcpConnect = connectMcpBatch(regularMcpConfigs, 'regular');
+      if (sdkUrl) {
+        if (process.env.CC_HAHA_DESKTOP_AWAIT_MCP === '1') {
+          await waitForDesktopMcpStartup(regularMcpConnect, 'regular MCP');
+        }
+      } else {
+        await regularMcpConnect;
+      }
       profileCheckpoint('after_connectMcp');
       // Dedup: suppress plugin MCP servers that duplicate a claude.ai
       // connector (connector wins), then connect claude.ai servers.
@@ -3027,7 +3094,8 @@ async function run(): Promise<CommanderCommand> {
           content: String(inputPrompt)
         })
       } : null,
-      effortValue: parseEffortValue(options.effort) ?? getInitialEffortSetting(),
+      effortValue: effectiveEffort,
+      ultracode: ultracodeRequested,
       activeOverlays: new Set<string>(),
       fastMode: getInitialFastModeSetting(resolvedInitialModel),
       ...(isAdvisorEnabled() && advisorModel && {
@@ -3088,6 +3156,9 @@ async function run(): Promise<CommanderCommand> {
       appendSystemPrompt,
       taskListId,
       thinkingConfig,
+      // An explicit --effort flag is authoritative over CLAUDE_CODE_EFFORT_LEVEL
+      // env (resolveAppliedEffort), matching the effectiveEffort precedence.
+      effortValueOverridesEnv: options.effort !== undefined,
       ...(uploaderReady && {
         onTurnComplete: (messages: MessageType[]) => {
           void uploaderReady.then(uploader => uploader?.(messages));
@@ -3102,7 +3173,8 @@ async function run(): Promise<CommanderCommand> {
       agentDefinitions,
       currentCwd,
       cliAgents,
-      initialState
+      initialState,
+      hasExplicitCliEffort: options.effort !== undefined
     };
     if (options.continue) {
       // Continue the most recent conversation directly
@@ -3815,6 +3887,7 @@ async function run(): Promise<CommanderCommand> {
 
   // Worktree flags
   program.option('-w, --worktree [name]', 'Create a new git worktree for this session (optionally specify a name)');
+  program.addOption(new Option('--worktree-base-ref <ref>', 'Create --worktree from this git ref instead of the default branch').hideHelp());
   program.option('--tmux', 'Create a tmux session for the worktree (requires --worktree). Uses iTerm2 native panes when available; use --tmux=classic for traditional tmux.');
   if (canUserConfigureAdvisor()) {
     program.addOption(new Option('--advisor <model>', 'Enable the server-side advisor tool with the specified model (alias or full ID).').hideHelp());
@@ -4104,16 +4177,18 @@ async function run(): Promise<CommanderCommand> {
   // claude auth
 
   const auth = program.command('auth').description('Manage authentication').configureHelp(createSortedHelpConfig());
-  auth.command('login').description('Sign in to your Anthropic account').option('--email <email>', 'Pre-populate email address on the login page').option('--sso', 'Force SSO login flow').option('--console', 'Use Anthropic Console (API usage billing) instead of Claude subscription').option('--claudeai', 'Use Claude subscription (default)').action(async ({
+  auth.command('login').description('Sign in to your Anthropic or OpenAI account').option('--email <email>', 'Pre-populate email address on the login page').option('--sso', 'Force SSO login flow').option('--console', 'Use Anthropic Console (API usage billing) instead of Claude subscription').option('--claudeai', 'Use Claude subscription (default)').option('--openai', 'Use OpenAI ChatGPT/Codex OAuth login').action(async ({
     email,
     sso,
     console: useConsole,
-    claudeai
+    claudeai,
+    openai,
   }: {
     email?: string;
     sso?: boolean;
     console?: boolean;
     claudeai?: boolean;
+    openai?: boolean;
   }) => {
     const {
       authLogin
@@ -4122,23 +4197,27 @@ async function run(): Promise<CommanderCommand> {
       email,
       sso,
       console: useConsole,
-      claudeai
+      claudeai,
+      openai,
     });
   });
-  auth.command('status').description('Show authentication status').option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  auth.command('status').description('Show authentication status').option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').option('--openai', 'Show OpenAI OAuth status').action(async (opts: {
     json?: boolean;
     text?: boolean;
+    openai?: boolean;
   }) => {
     const {
       authStatus
     } = await import('./cli/handlers/auth.js');
     await authStatus(opts);
   });
-  auth.command('logout').description('Log out from your Anthropic account').action(async () => {
+  auth.command('logout').description('Log out from your Anthropic or OpenAI account').option('--openai', 'Log out from OpenAI OAuth only').action(async (opts: {
+    openai?: boolean;
+  }) => {
     const {
       authLogout
     } = await import('./cli/handlers/auth.js');
-    await authLogout();
+    await authLogout(opts);
   });
 
   /**

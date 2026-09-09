@@ -15,6 +15,7 @@ export function initBundledSkills(): void {
   require('./updateConfig.js').registerUpdateConfigSkill()
   require('./keybindings.js').registerKeybindingsSkill()
   require('./verify.js').registerVerifySkill()
+  require('./imagegen.js').registerImagegenSkill()
   require('./debug.js').registerDebugSkill()
   require('./loremIpsum.js').registerLoremIpsumSkill()
   require('./skillify.js').registerSkillifySkill()
@@ -22,6 +23,7 @@ export function initBundledSkills(): void {
   require('./simplify.js').registerSimplifySkill()
   require('./batch.js').registerBatchSkill()
   require('./stuck.js').registerStuckSkill()
+  require('./computerUse.js').registerComputerUseSkill()
   if (feature('KAIROS') || feature('KAIROS_DREAM')) {
     const { registerDreamSkill } = require('./dream.js')
     registerDreamSkill()

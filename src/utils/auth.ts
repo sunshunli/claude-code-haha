@@ -10,7 +10,10 @@ import {
   logEvent,
 } from 'src/services/analytics/index.js'
 import { getModelStrings } from 'src/utils/model/modelStrings.js'
-import { getAPIProvider } from 'src/utils/model/providers.js'
+import {
+  getAPIProvider,
+  isFirstPartyAnthropicBaseUrl,
+} from 'src/utils/model/providers.js'
 import {
   getIsNonInteractiveSession,
   preferThirdPartyAuthentication,
@@ -19,6 +22,7 @@ import {
   getMockSubscriptionType,
   shouldUseMockSubscription,
 } from '../services/mockRateLimits.js'
+import { getOpenAIOAuthTokens } from '../services/openaiAuth/storage.js'
 import {
   isOAuthTokenExpired,
   refreshOAuthToken,
@@ -115,7 +119,8 @@ export function isAnthropicAuthEnabled(): boolean {
   const is3P =
     isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY) ||
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_AZURE_OPENAI)
 
   // Check if user has configured an external API key source
   // This allows externally-provided API keys to work (without requiring proxy configuration)
@@ -127,9 +132,14 @@ export function isAnthropicAuthEnabled(): boolean {
     process.env.CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR
 
   // Check if API key is from an external source (not managed by /login)
-  const { source: apiKeySource } = getAnthropicApiKeyWithSource({
-    skipRetrievingKeyFromApiKeyHelper: true,
-  })
+  let apiKeySource: ApiKeySource = 'none'
+  try {
+    ;({ source: apiKeySource } = getAnthropicApiKeyWithSource({
+      skipRetrievingKeyFromApiKeyHelper: true,
+    }))
+  } catch {
+    apiKeySource = 'none'
+  }
   const hasExternalApiKey =
     apiKeySource === 'ANTHROPIC_API_KEY' || apiKeySource === 'apiKeyHelper'
 
@@ -1182,6 +1192,27 @@ export async function removeApiKey(): Promise<void> {
   clearLegacyApiKeyPrefetch()
 }
 
+export function clearStoredClaudeAIOAuthTokens(): {
+  success: boolean
+  warning?: string
+} {
+  try {
+    const secureStorage = getSecureStorage()
+    const storageData = secureStorage.read() || {}
+
+    if ('claudeAiOauth' in storageData) {
+      delete storageData.claudeAiOauth
+    }
+
+    const result = secureStorage.update(storageData)
+    clearOAuthTokenCache()
+    return result
+  } catch (error) {
+    logError(error)
+    return { success: false, warning: 'Failed to clear stored Claude OAuth tokens' }
+  }
+}
+
 async function maybeRemoveApiKeyFromMacOSKeychain(): Promise<void> {
   try {
     await maybeRemoveApiKeyFromMacOSKeychainThrows()
@@ -1562,7 +1593,14 @@ async function checkAndRefreshOAuthTokenIfNeededImpl(
 }
 
 export function isClaudeAISubscriber(): boolean {
-  if (!isAnthropicAuthEnabled()) {
+  let anthropicAuthEnabled = false
+  try {
+    anthropicAuthEnabled = isAnthropicAuthEnabled()
+  } catch {
+    anthropicAuthEnabled = false
+  }
+
+  if (!anthropicAuthEnabled) {
     return false
   }
 
@@ -1594,8 +1632,13 @@ export function is1PApiCustomer(): boolean {
   if (
     isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY) ||
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_AZURE_OPENAI)
   ) {
+    return false
+  }
+
+  if (!isFirstPartyAnthropicBaseUrl()) {
     return false
   }
 
@@ -1733,7 +1776,8 @@ export function isUsing3PServices(): boolean {
   return !!(
     isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY) ||
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_AZURE_OPENAI)
   )
 }
 
@@ -1853,11 +1897,72 @@ export function isConsumerSubscriber(): boolean {
 }
 
 export type UserAccountInfo = {
+  provider?: 'anthropic' | 'openai'
   subscription?: string
   tokenSource?: string
   apiKeySource?: ApiKeySource
   organization?: string
   email?: string
+  accountId?: string
+}
+
+export function getOpenAISubscriptionName(): string {
+  return 'ChatGPT Pro/Plus'
+}
+
+export function getOpenAIAuthOverrideWarning(): string | null {
+  if (isUsing3PServices()) {
+    return 'OpenAI login is saved, but this shell is configured for a third-party provider.'
+  }
+
+  const { source: authTokenSource } = getAuthTokenSource()
+  if (authTokenSource !== 'none') {
+    return `OpenAI login is saved, but this shell is still using ${authTokenSource} for Anthropic-compatible auth.`
+  }
+
+  const { source: apiKeySource } = getAnthropicApiKeyWithSource({
+    skipRetrievingKeyFromApiKeyHelper: true,
+  })
+  if (apiKeySource !== 'none') {
+    return `OpenAI login is saved, but this shell is still using ${apiKeySource} for Anthropic-compatible auth.`
+  }
+
+  return null
+}
+
+export function hasOpenAIAuthLogin(): boolean {
+  const openaiTokens = getOpenAIOAuthTokens()
+  return !!openaiTokens?.refreshToken && !isUsing3PServices()
+}
+
+export function isOpenAIAuthActive(): boolean {
+  return getOpenAIAccountInformationIfActive() !== undefined
+}
+
+function getOpenAIAccountInformationIfActive(input?: {
+  authTokenSource?: ReturnType<typeof getAuthTokenSource>['source']
+  apiKeySource?: ApiKeySource
+}): UserAccountInfo | undefined {
+  const openaiTokens = getOpenAIOAuthTokens()
+  if (!openaiTokens?.refreshToken || isUsing3PServices()) {
+    return undefined
+  }
+
+  const authTokenSource = input?.authTokenSource ?? getAuthTokenSource().source
+  const apiKeySource =
+    input?.apiKeySource ?? getAnthropicApiKeyWithSource().source
+
+  if (authTokenSource !== 'none' || apiKeySource !== 'none') {
+    return undefined
+  }
+
+  return {
+    provider: 'openai',
+    subscription: getOpenAISubscriptionName(),
+    tokenSource: 'OpenAI OAuth',
+    email: openaiTokens.email,
+    accountId: openaiTokens.accountId,
+  }
 }
 
 export function getAccountInformation() {
@@ -1867,7 +1972,17 @@ export function getAccountInformation() {
     return undefined
   }
   const { source: authTokenSource } = getAuthTokenSource()
+  const { key: apiKey, source: apiKeySource } = getAnthropicApiKeyWithSource()
+  const openAIAccountInfo = getOpenAIAccountInformationIfActive({
+    authTokenSource,
+    apiKeySource,
+  })
+  if (openAIAccountInfo) {
+    return openAIAccountInfo
+  }
+
   const accountInfo: UserAccountInfo = {}
+  accountInfo.provider = 'anthropic'
   if (
     authTokenSource === 'CLAUDE_CODE_OAUTH_TOKEN' ||
     authTokenSource === 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'
@@ -1878,7 +1993,6 @@ export function getAccountInformation() {
   } else {
     accountInfo.tokenSource = authTokenSource
   }
-  const { key: apiKey, source: apiKeySource } = getAnthropicApiKeyWithSource()
   if (apiKey) {
     accountInfo.apiKeySource = apiKeySource
   }

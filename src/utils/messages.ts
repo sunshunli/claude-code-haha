@@ -1,3 +1,10 @@
+import { describeWorkflowSizeGuideline } from './workflows/enabled.js'
+import {
+  ULTRACODE_ENTER_REMINDER,
+  ULTRACODE_EXIT_REMINDER,
+  ULTRACODE_STILL_ON_REMINDER,
+  WORKFLOW_KEYWORD_REMINDER,
+} from './workflows/ultracode.js'
 import { feature } from 'bun:bundle'
 import type { BetaUsage as Usage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import type {
@@ -22,8 +29,16 @@ import {
 import { sanitizeToolNameForAnalytics } from 'src/services/analytics/metadata.js'
 import type { AgentId } from 'src/types/ids.js'
 import { companionIntroText } from '../buddy/prompt.js'
-import { NO_CONTENT_MESSAGE } from '../constants/messages.js'
+import {
+  NO_CONTENT_MESSAGE,
+  REJECT_MESSAGE,
+  REJECT_MESSAGE_WITH_REASON_PREFIX,
+} from '../constants/messages.js'
 import { OUTPUT_STYLE_CONFIG } from '../constants/outputStyles.js'
+import {
+  type BusinessErrorCode,
+  BUSINESS_ERROR_MEDIA_BLOCK_TYPES,
+} from '../constants/businessErrors.js'
 import { isAutoMemoryEnabled } from '../memdir/paths.js'
 import {
   checkStatsigFeatureGate_CACHED_MAY_BE_STALE,
@@ -31,6 +46,7 @@ import {
 } from '../services/analytics/growthbook.js'
 import {
   getImageTooLargeErrorMessage,
+  getImageUnsupportedErrorMessage,
   getPdfInvalidErrorMessage,
   getPdfPasswordProtectedErrorMessage,
   getPdfTooLargeErrorMessage,
@@ -66,6 +82,7 @@ import type {
   SystemPermissionRetryMessage,
   SystemScheduledTaskFireMessage,
   SystemStopHookSummaryMessage,
+  SystemStreamingFallbackMessage,
   SystemTurnDurationMessage,
   TombstoneMessage,
   ToolUseSummaryMessage,
@@ -155,6 +172,10 @@ import { safeParseJSON } from './json.js'
 import { logError, logMCPDebug } from './log.js'
 import { normalizeLegacyToolName } from './permissions/permissionRuleParser.js'
 import {
+  normalizeModelStringForAPI,
+  parseUserSpecifiedModel,
+} from './model/model.js'
+import {
   getPlanModeV2AgentCount,
   getPlanModeV2ExploreAgentCount,
   isPlanModeInterviewPhaseEnabled,
@@ -209,10 +230,7 @@ export const INTERRUPT_MESSAGE_FOR_TOOL_USE =
   '[Request interrupted by user for tool use]'
 export const CANCEL_MESSAGE =
   "The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed."
-export const REJECT_MESSAGE =
-  "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."
-export const REJECT_MESSAGE_WITH_REASON_PREFIX =
-  "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said:\n"
+export { REJECT_MESSAGE, REJECT_MESSAGE_WITH_REASON_PREFIX }
 export const SUBAGENT_REJECT_MESSAGE =
   'Permission for this tool use was denied. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). Try a different approach or report the limitation to complete your task.'
 export const SUBAGENT_REJECT_MESSAGE_WITH_REASON_PREFIX =
@@ -358,6 +376,7 @@ function baseCreateAssistantMessage({
   apiError,
   error,
   errorDetails,
+  businessErrorCode,
   isVirtual,
   usage = {
     input_tokens: 0,
@@ -380,6 +399,7 @@ function baseCreateAssistantMessage({
   apiError?: AssistantMessage['apiError']
   error?: SDKAssistantMessageError
   errorDetails?: string
+  businessErrorCode?: BusinessErrorCode
   isVirtual?: true
   usage?: Usage
 }): AssistantMessage {
@@ -403,6 +423,7 @@ function baseCreateAssistantMessage({
     apiError,
     error,
     errorDetails,
+    businessErrorCode,
     isApiErrorMessage,
     isVirtual,
   }
@@ -437,11 +458,13 @@ export function createAssistantAPIErrorMessage({
   apiError,
   error,
   errorDetails,
+  businessErrorCode,
 }: {
   content: string
   apiError?: AssistantMessage['apiError']
   error?: SDKAssistantMessageError
   errorDetails?: string
+  businessErrorCode?: BusinessErrorCode
 }): AssistantMessage {
   return baseCreateAssistantMessage({
     content: [
@@ -454,6 +477,7 @@ export function createAssistantAPIErrorMessage({
     apiError,
     error,
     errorDetails,
+    businessErrorCode,
   })
 }
 
@@ -768,6 +792,9 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
             uuid,
             error: message.error,
             isApiErrorMessage: message.isApiErrorMessage,
+            apiError: message.apiError,
+            errorDetails: message.errorDetails,
+            businessErrorCode: message.businessErrorCode,
             advisorModel: message.advisorModel,
           } as NormalizedAssistantMessage
         })
@@ -2000,12 +2027,15 @@ export function normalizeMessagesForAPI(
     m => !((m.type === 'user' || m.type === 'assistant') && m.isVirtual),
   )
 
-  // Build a map from error text → which block types to strip from the preceding user message.
+  // Build a fallback map from legacy error text → which block types to strip
+  // from the preceding user message. New synthetic errors use stable
+  // businessErrorCode values so translated display text cannot break recovery.
   const errorToBlockTypes: Record<string, Set<string>> = {
     [getPdfTooLargeErrorMessage()]: new Set(['document']),
     [getPdfPasswordProtectedErrorMessage()]: new Set(['document']),
     [getPdfInvalidErrorMessage()]: new Set(['document']),
     [getImageTooLargeErrorMessage()]: new Set(['image']),
+    [getImageUnsupportedErrorMessage()]: new Set(['image']),
     [getRequestTooLargeErrorMessage()]: new Set(['document', 'image']),
   }
 
@@ -2017,23 +2047,33 @@ export function normalizeMessagesForAPI(
     if (!isSyntheticApiErrorMessage(msg)) {
       continue
     }
-    // Determine which error this is
+    let blockTypesToStrip: Set<string> | undefined
+    const blockTypesFromCode =
+      typeof msg.businessErrorCode === 'string'
+        ? BUSINESS_ERROR_MEDIA_BLOCK_TYPES[msg.businessErrorCode as BusinessErrorCode]
+        : undefined
+    if (blockTypesFromCode) {
+      blockTypesToStrip = new Set(blockTypesFromCode)
+    }
+
+    // Determine which legacy text error this is.
     const errorText =
       Array.isArray(msg.message.content) &&
       msg.message.content[0]?.type === 'text'
         ? msg.message.content[0].text
         : undefined
-    if (!errorText) {
-      continue
+    if (!blockTypesToStrip && errorText) {
+      blockTypesToStrip = errorToBlockTypes[errorText]
     }
-    const blockTypesToStrip = errorToBlockTypes[errorText]
     if (!blockTypesToStrip) {
       continue
     }
-    // Walk backward to find the nearest preceding isMeta user message
+    // Walk backward to find the nearest preceding user message. Normal pasted
+    // images are ordinary user turns, while attachment-derived media can be
+    // meta turns; both need to be stripped after a provider media rejection.
     for (let j = i - 1; j >= 0; j--) {
       const candidate = reorderedMessages[j]!
-      if (candidate.type === 'user' && candidate.isMeta) {
+      if (candidate.type === 'user') {
         const existing = stripTargets.get(candidate.uuid)
         if (existing) {
           for (const t of blockTypesToStrip) {
@@ -2044,16 +2084,18 @@ export function normalizeMessagesForAPI(
         }
         break
       }
-      // Skip over other synthetic error messages or non-meta messages
+      // Skip over other synthetic error messages
       if (isSyntheticApiErrorMessage(candidate)) {
         continue
       }
-      // Stop if we hit an assistant message or non-meta user message
+      // Stop if we hit an assistant message or any other non-user message.
       break
     }
   }
 
   const result: (UserMessage | AssistantMessage)[] = []
+  const assistantIndexByMessageId = new Map<string, number>()
+  let indexedResultLength = 0
   reorderedMessages
     .filter(
       (
@@ -2110,11 +2152,11 @@ export function normalizeMessagesForAPI(
             )
           }
 
-          // Strip document/image blocks from the specific meta user message that
+          // Strip document/image blocks from the specific user message that
           // preceded a PDF/image/request-too-large error, to prevent re-sending
           // the problematic content on every subsequent API call.
           const typesToStrip = stripTargets.get(normalizedMessage.uuid)
-          if (typesToStrip && normalizedMessage.isMeta) {
+          if (typesToStrip) {
             const content = normalizedMessage.message.content
             if (Array.isArray(content)) {
               const filtered = content.filter(
@@ -2243,33 +2285,57 @@ export function normalizeMessagesForAPI(
             },
           }
 
-          // Find a previous assistant message with the same message ID and merge.
-          // Walk backwards, skipping tool results and different-ID assistants,
-          // since concurrent agents (teammates) can interleave streaming content
-          // blocks from multiple API responses with different message IDs.
-          for (let i = result.length - 1; i >= 0; i--) {
-            const msg = result[i]!
-
-            if (msg.type !== 'assistant' && !isToolResultMessage(msg)) {
-              break
+          // Index each result message once so interleaved assistant fragments
+          // can be merged without repeatedly scanning the full tool-result chain.
+          // A normal user message is a hard turn boundary, matching the previous
+          // backward scan's stopping condition.
+          for (; indexedResultLength < result.length; indexedResultLength++) {
+            const indexedMessage = result[indexedResultLength]!
+            if (indexedMessage.type === 'assistant') {
+              assistantIndexByMessageId.set(
+                indexedMessage.message.id,
+                indexedResultLength,
+              )
+            } else if (!isToolResultMessage(indexedMessage)) {
+              assistantIndexByMessageId.clear()
             }
+          }
 
-            if (msg.type === 'assistant') {
-              if (msg.message.id === normalizedMessage.message.id) {
-                result[i] = mergeAssistantMessages(msg, normalizedMessage)
-                return
-              }
-              continue
-            }
+          const existingIndex = assistantIndexByMessageId.get(
+            normalizedMessage.message.id,
+          )
+          const existingMessage =
+            existingIndex === undefined ? undefined : result[existingIndex]
+          if (
+            existingIndex !== undefined &&
+            existingMessage?.type === 'assistant'
+          ) {
+            result[existingIndex] = mergeAssistantMessages(
+              existingMessage,
+              normalizedMessage,
+            )
+            return
           }
 
           result.push(normalizedMessage)
           return
         }
         case 'attachment': {
-          const rawAttachmentMessage = normalizeAttachmentForAPI(
-            message.attachment,
-          )
+          let rawAttachmentMessage: UserMessage[]
+          try {
+            rawAttachmentMessage = normalizeAttachmentForAPI(message.attachment)
+          } catch (error) {
+            const attachmentType = (message as {
+              attachment?: { type?: unknown }
+            }).attachment?.type
+            logForDebugging(
+              `Dropping malformed attachment during API normalization: ${
+                typeof attachmentType === 'string' ? attachmentType : 'unknown'
+              }: ${error instanceof Error ? error.message : String(error)}`,
+              { level: 'warn' },
+            )
+            return
+          }
           const attachmentMessage = checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
             'tengu_chair_sermon',
           )
@@ -2310,6 +2376,21 @@ export function normalizeMessagesForAPI(
   // mismatched thinking block signatures cause API 400 errors.
   const withFilteredOrphans = filterOrphanedThinkingOnlyMessages(relocated)
 
+  // Reorder assistant content so any tool_use blocks form a contiguous run.
+  // mergeAssistantMessages also reorders, but this pass additionally protects
+  // single-message cases (e.g. sessions resumed from disk that were persisted
+  // before this fix landed). See reorderAssistantToolUseBlocks for the
+  // Bedrock validation rationale.
+  const withReorderedToolUse = withFilteredOrphans.map(msg => {
+    if (msg.type !== 'assistant') return msg
+    const reordered = reorderAssistantToolUseBlocks(msg.message.content)
+    if (reordered === msg.message.content) return msg
+    return {
+      ...msg,
+      message: { ...msg.message, content: reordered },
+    }
+  })
+
   // Order matters: strip trailing thinking first, THEN filter whitespace-only
   // messages. The reverse order has a bug: a message like [text("\n\n"), thinking("...")]
   // survives the whitespace filter (has a non-text block), then thinking stripping
@@ -2319,7 +2400,7 @@ export function normalizeMessagesForAPI(
   // conditions a prior pass was meant to handle. Consider unifying into a single
   // pass that cleans content, then validates in one shot.
   const withFilteredThinking =
-    filterTrailingThinkingFromLastAssistant(withFilteredOrphans)
+    filterTrailingThinkingFromLastAssistant(withReorderedToolUse)
   const withFilteredWhitespace =
     filterWhitespaceOnlyAssistantMessages(withFilteredThinking)
   const withNonEmpty = ensureNonEmptyAssistantContent(withFilteredWhitespace)
@@ -2334,7 +2415,9 @@ export function normalizeMessagesForAPI(
   const smooshed = checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
     'tengu_chair_sermon',
   )
-    ? smooshSystemReminderSiblings(mergeAdjacentUserMessages(withNonEmpty))
+    ? smooshSystemReminderSiblings(
+        mergeAdjacentUserMessages(withNonEmpty),
+      )
     : withNonEmpty
 
   // Unconditional — catches transcripts persisted before smooshIntoToolResult
@@ -2394,9 +2477,83 @@ export function mergeAssistantMessages(
     ...a,
     message: {
       ...a.message,
-      content: [...a.message.content, ...b.message.content],
+      // Reorder so that any tool_use blocks introduced by `b` don't end up
+      // separated from `a`'s tool_use blocks by intervening text. Without
+      // this, Bedrock's strict history validation rejects "tool_use ids …
+      // without tool_result blocks immediately after" because text inside
+      // the tool_use cluster makes the earlier tool_use blocks no longer
+      // count as "trailing" — only the final tool_use is paired with the
+      // next message's tool_results.
+      content: reorderAssistantToolUseBlocks([
+        ...a.message.content,
+        ...b.message.content,
+      ]),
     },
   }
+}
+
+/**
+ * Reorder an assistant message's content so that all `tool_use` blocks form
+ * a contiguous run. Any non-`tool_use` blocks that the model emitted in the
+ * middle of that run (typically `text`) are pushed to the position right
+ * after the last `tool_use`.
+ *
+ * Why: Anthropic's history validation (and Bedrock's stricter copy of it)
+ * requires every `tool_use` block to be paired with a matching `tool_result`
+ * in the next message. The validator only treats the *trailing* run of
+ * `tool_use` blocks as "needing tool_results next", so when the model
+ * streams `text` between tool calls — e.g. `tu1, tu2, tu3, tu4, text, tu5` —
+ * only `tu5` is considered trailing on the next request, and `tu1..tu4` are
+ * reported as missing tool_results, producing a 400 on the *next* turn even
+ * though the previous turn returned all 5 tool_results correctly.
+ *
+ * Block-type policy:
+ * - `thinking` and `redacted_thinking` keep their relative positions
+ *   (signatures are position-sensitive within a turn).
+ * - `tool_use` blocks become contiguous, in their original id order
+ *   (preserves any caller logic that pairs tool_results by index).
+ * - Non-`tool_use`, non-thinking blocks that were interleaved between
+ *   tool_use blocks are moved to immediately after the tool_use cluster.
+ *
+ * No blocks are dropped. The function is a no-op when there are fewer than
+ * two `tool_use` blocks or when the existing tool_use run is already
+ * contiguous.
+ */
+export function reorderAssistantToolUseBlocks<T extends { type: string }>(
+  content: T[],
+): T[] {
+  if (content.length < 2) return content
+
+  const toolUseIndices: number[] = []
+  for (let i = 0; i < content.length; i++) {
+    if (content[i]!.type === 'tool_use') toolUseIndices.push(i)
+  }
+  if (toolUseIndices.length < 2) return content
+
+  const first = toolUseIndices[0]!
+  const last = toolUseIndices[toolUseIndices.length - 1]!
+
+  let hasInterleaved = false
+  for (let i = first; i <= last; i++) {
+    if (content[i]!.type !== 'tool_use') {
+      hasInterleaved = true
+      break
+    }
+  }
+  if (!hasInterleaved) return content
+
+  const head = content.slice(0, first)
+  const window = content.slice(first, last + 1)
+  const tail = content.slice(last + 1)
+
+  const tools: T[] = []
+  const displaced: T[] = []
+  for (const block of window) {
+    if (block.type === 'tool_use') tools.push(block)
+    else displaced.push(block)
+  }
+
+  return [...head, ...tools, ...displaced, ...tail]
 }
 
 function isToolResultMessage(msg: Message): boolean {
@@ -4175,6 +4332,43 @@ You have exited auto mode. The user may now want to interact more directly. You 
         }),
       ])
     }
+    case 'workflow_keyword_request': {
+      return wrapMessagesInSystemReminder([
+        createUserMessage({
+          content: WORKFLOW_KEYWORD_REMINDER,
+          isMeta: true,
+        }),
+      ])
+    }
+    case 'ultra_effort_enter': {
+      return wrapMessagesInSystemReminder([
+        createUserMessage({
+          content:
+            attachment.reminderType === 'full'
+              ? ULTRACODE_ENTER_REMINDER
+              : ULTRACODE_STILL_ON_REMINDER,
+          isMeta: true,
+        }),
+      ])
+    }
+    case 'ultra_effort_exit': {
+      return wrapMessagesInSystemReminder([
+        createUserMessage({
+          content: ULTRACODE_EXIT_REMINDER,
+          isMeta: true,
+        }),
+      ])
+    }
+    case 'workflow_size_guideline_change': {
+      return wrapMessagesInSystemReminder([
+        createUserMessage({
+          content: describeWorkflowSizeGuideline(
+            attachment.size as Parameters<typeof describeWorkflowSizeGuideline>[0],
+          ),
+          isMeta: true,
+        }),
+      ])
+    }
     case 'deferred_tools_delta': {
       const parts: string[] = []
       if (attachment.addedLines.length > 0) {
@@ -4597,6 +4791,33 @@ export function createSystemAPIErrorMessage(
     retryInMs,
     retryAttempt,
     maxRetries,
+    timestamp: new Date().toISOString(),
+    uuid: randomUUID(),
+  }
+}
+
+export type StreamingFallbackCause =
+  | 'watchdog'
+  | 'stream_error'
+  | '404_stream_creation'
+  | 'stream_retry'
+
+/**
+ * Marks recovery from a failed streaming attempt. Most causes switch to the
+ * non-streaming fallback; stream_retry starts a new bounded streaming attempt.
+ * UIs surface this as an active-turn status rather than a terminal error.
+ */
+export function createSystemStreamingFallbackMessage(
+  cause: StreamingFallbackCause,
+): SystemStreamingFallbackMessage {
+  return {
+    type: 'system',
+    subtype: 'streaming_fallback',
+    level: 'info',
+    content: cause === 'stream_retry'
+      ? 'Provider stream stalled before a tool side effect; retrying safely'
+      : `Streaming request failed (${cause.replace(/_/g, ' ')}); retrying in non-streaming mode`,
+    cause,
     timestamp: new Date().toISOString(),
     uuid: randomUUID(),
   }
@@ -5093,6 +5314,41 @@ export function stripSignatureBlocks(messages: Message[]): Message[] {
       ...msg,
       message: { ...msg.message, content: filtered },
     } as typeof msg
+  })
+
+  return changed ? result : messages
+}
+
+/**
+ * Protected thinking signatures are model-bound. When a resumed session moves
+ * to another model, replaying those blocks can either fail signature validation
+ * or send a block type the new provider does not implement. Keep the transcript
+ * intact and clean only the in-memory request history.
+ */
+export function stripSignatureBlocksAfterModelChange(
+  messages: Message[],
+  currentModel: string,
+): Message[] {
+  const normalize = (model: string) => normalizeModelStringForAPI(
+    parseUserSpecifiedModel(model),
+  ).trim().toLowerCase()
+  const targetModel = normalize(currentModel)
+  let changed = false
+
+  // A new turn reloads the original transcript, including blocks cleaned only
+  // in memory on the previous turn. Inspect every source: the latest reply can
+  // already match the target while older, incompatible blocks remain.
+  const result = messages.map(msg => {
+    if (
+      msg.type !== 'assistant' ||
+      !msg.message.model ||
+      msg.message.model === SYNTHETIC_MODEL ||
+      normalize(msg.message.model) === targetModel
+    ) return msg
+
+    const [cleaned] = stripSignatureBlocks([msg])
+    if (cleaned !== msg) changed = true
+    return cleaned!
   })
 
   return changed ? result : messages

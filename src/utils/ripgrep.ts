@@ -1,5 +1,6 @@
 import type { ChildProcess, ExecFileException } from 'child_process'
-import { execFile, spawn } from 'child_process'
+import { execFile, spawn, spawnSync } from 'child_process'
+import { existsSync } from 'fs'
 import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
 import * as path from 'path'
@@ -21,11 +22,142 @@ const __dirname = path.join(
   process.env.NODE_ENV === 'test' ? '../../../' : '../',
 )
 
+const BUN_VIRTUAL_PATH_MARKERS = ['$bunfs', '~BUN']
+
 type RipgrepConfig = {
-  mode: 'system' | 'builtin' | 'embedded'
+  mode: 'system' | 'builtin' | 'embedded' | 'unavailable'
   command: string
   args: string[]
   argv0?: string
+}
+
+export const CC_HAHA_RIPGREP_PATH_ENV = 'CC_HAHA_RIPGREP_PATH'
+
+function isBunVirtualPath(candidatePath: string): boolean {
+  const normalized = candidatePath.replace(/\\/g, '/')
+  return BUN_VIRTUAL_PATH_MARKERS.some(marker => normalized.includes(marker))
+}
+
+export function isUsableBuiltinRipgrepPath(candidatePath: string): boolean {
+  return !isBunVirtualPath(candidatePath) && existsSync(candidatePath)
+}
+
+function systemRipgrepConfig(): RipgrepConfig | null {
+  const systemPath = findUsableSystemRipgrep()
+  if (systemPath === null) {
+    return null
+  }
+
+  return { mode: 'system', command: systemPath, args: [] }
+}
+
+function findUsableSystemRipgrep(): string | null {
+  for (const candidate of systemRipgrepCandidates()) {
+    if (!existsSync(candidate)) continue
+    const result = spawnSync(candidate, ['--version'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      windowsHide: true,
+    })
+    if (
+      result.status === 0 &&
+      typeof result.stdout === 'string' &&
+      result.stdout.startsWith('ripgrep ')
+    ) {
+      return candidate
+    }
+  }
+  return null
+}
+
+function systemRipgrepCandidates(): string[] {
+  const candidates: string[] = []
+  const seen = new Set<string>()
+  const addCandidate = (candidate: string | null | undefined) => {
+    if (!candidate || candidate === 'rg') return
+    const key =
+      process.platform === 'win32' ? candidate.toLowerCase() : candidate
+    if (seen.has(key)) return
+    seen.add(key)
+    candidates.push(candidate)
+  }
+
+  addCandidate(findExecutable('rg', []).cmd)
+
+  const pathEntries = (process.env.PATH ?? '').split(path.delimiter)
+  const extensions =
+    process.platform === 'win32'
+      ? (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD')
+          .split(';')
+          .filter(Boolean)
+      : ['']
+
+  for (const dir of pathEntries) {
+    if (!dir) continue
+    for (const ext of extensions) {
+      addCandidate(path.join(dir, `rg${ext.toLowerCase()}`))
+      if (process.platform === 'win32') {
+        addCandidate(path.join(dir, `rg${ext.toUpperCase()}`))
+      }
+    }
+  }
+
+  return candidates
+}
+
+function builtinRipgrepConfig(): RipgrepConfig {
+  const rgRoot = path.resolve(__dirname, 'vendor', 'ripgrep')
+  const command =
+    process.platform === 'win32'
+      ? path.resolve(rgRoot, `${process.arch}-win32`, 'rg.exe')
+      : path.resolve(rgRoot, `${process.arch}-${process.platform}`, 'rg')
+
+  return { mode: 'builtin', command, args: [] }
+}
+
+function runtimeTargetTriple(
+  platform: NodeJS.Platform,
+  arch: NodeJS.Architecture,
+): string | null {
+  if (platform === 'darwin' && arch === 'arm64') return 'aarch64-apple-darwin'
+  if (platform === 'darwin' && arch === 'x64') return 'x86_64-apple-darwin'
+  if (platform === 'win32' && arch === 'arm64') return 'aarch64-pc-windows-msvc'
+  if (platform === 'win32' && arch === 'x64') return 'x86_64-pc-windows-msvc'
+  if (platform === 'linux' && arch === 'arm64') return 'aarch64-unknown-linux-gnu'
+  if (platform === 'linux' && arch === 'x64') return 'x86_64-unknown-linux-gnu'
+  return null
+}
+
+export function getBundledRipgrepPath({
+  platform = process.platform,
+  arch = process.arch,
+  execPath = process.execPath,
+}: {
+  platform?: NodeJS.Platform
+  arch?: NodeJS.Architecture
+  execPath?: string
+} = {}): string | null {
+  const targetTriple = runtimeTargetTriple(platform, arch)
+  if (!targetTriple) return null
+  const pathApi = platform === 'win32' ? path.win32 : path.posix
+  return pathApi.join(
+    pathApi.dirname(execPath),
+    platform === 'win32' ? 'rg.exe' : 'rg',
+  )
+}
+
+function packagedRipgrepConfig(): RipgrepConfig | null {
+  const explicitPath = process.env[CC_HAHA_RIPGREP_PATH_ENV]?.trim()
+  if (explicitPath && isUsableBuiltinRipgrepPath(explicitPath)) {
+    return { mode: 'builtin', command: explicitPath, args: ['--no-config'] }
+  }
+
+  const siblingPath = getBundledRipgrepPath()
+  if (siblingPath && isUsableBuiltinRipgrepPath(siblingPath)) {
+    return { mode: 'builtin', command: siblingPath, args: ['--no-config'] }
+  }
+
+  return null
 }
 
 const getRipgrepConfig = memoize((): RipgrepConfig => {
@@ -35,13 +167,18 @@ const getRipgrepConfig = memoize((): RipgrepConfig => {
 
   // Try system ripgrep if user wants it
   if (userWantsSystemRipgrep) {
-    const { cmd: systemPath } = findExecutable('rg', [])
-    if (systemPath !== 'rg') {
-      // SECURITY: Use command name 'rg' instead of systemPath to prevent PATH hijacking
-      // If we used systemPath, a malicious ./rg.exe in current directory could be executed
-      // Using just 'rg' lets the OS resolve it safely with NoDefaultCurrentDirectoryInExePath protection
-      return { mode: 'system', command: 'rg', args: [] }
-    }
+    return (
+      systemRipgrepConfig() ?? {
+        mode: 'unavailable',
+        command: '',
+        args: [],
+      }
+    )
+  }
+
+  const packagedConfig = packagedRipgrepConfig()
+  if (packagedConfig) {
+    return packagedConfig
   }
 
   // In bundled (native) mode, ripgrep is statically compiled into bun-internal
@@ -55,13 +192,18 @@ const getRipgrepConfig = memoize((): RipgrepConfig => {
     }
   }
 
-  const rgRoot = path.resolve(__dirname, 'vendor', 'ripgrep')
-  const command =
-    process.platform === 'win32'
-      ? path.resolve(rgRoot, `${process.arch}-win32`, 'rg.exe')
-      : path.resolve(rgRoot, `${process.arch}-${process.platform}`, 'rg')
+  const builtinConfig = builtinRipgrepConfig()
+  if (isUsableBuiltinRipgrepPath(builtinConfig.command)) {
+    return builtinConfig
+  }
 
-  return { mode: 'builtin', command, args: [] }
+  return (
+    systemRipgrepConfig() ?? {
+      mode: 'unavailable',
+      command: '',
+      args: [],
+    }
+  )
 })
 
 export function ripgrepCommand(): {
@@ -121,6 +263,11 @@ function ripGrepRaw(
   // pattern is provided
 
   const { rgPath, rgArgs, argv0 } = ripgrepCommand()
+  if (!rgPath) {
+    throw new Error(
+      'ripgrep is not available. Install ripgrep and ensure rg --version works in this environment.',
+    )
+  }
 
   // Use single-threaded mode only if explicitly requested for this call's retry
   const threadArgs = singleThread ? ['-j', '1'] : []
@@ -250,6 +397,11 @@ async function ripGrepFileCount(
 ): Promise<number> {
   await codesignRipgrepIfNecessary()
   const { rgPath, rgArgs, argv0 } = ripgrepCommand()
+  if (!rgPath) {
+    throw new Error(
+      'ripgrep is not available. Install ripgrep and ensure rg --version works in this environment.',
+    )
+  }
 
   return new Promise<number>((resolve, reject) => {
     const child = spawn(rgPath, [...rgArgs, ...args, target], {
@@ -300,6 +452,11 @@ export async function ripGrepStream(
 ): Promise<void> {
   await codesignRipgrepIfNecessary()
   const { rgPath, rgArgs, argv0 } = ripgrepCommand()
+  if (!rgPath) {
+    throw new Error(
+      'ripgrep is not available. Install ripgrep and ensure rg --version works in this environment.',
+    )
+  }
 
   return new Promise<void>((resolve, reject) => {
     const child = spawn(rgPath, [...rgArgs, ...args, target], {
@@ -533,7 +690,7 @@ let ripgrepStatus: {
  * Returns current configuration immediately, with working status if available
  */
 export function getRipgrepStatus(): {
-  mode: 'system' | 'builtin' | 'embedded'
+  mode: 'system' | 'builtin' | 'embedded' | 'unavailable'
   path: string
   working: boolean | null // null if not yet tested
 } {
@@ -555,6 +712,19 @@ const testRipgrepOnFirstUse = memoize(async (): Promise<void> => {
   }
 
   const config = getRipgrepConfig()
+  if (config.mode === 'unavailable') {
+    ripgrepStatus = {
+      working: false,
+      lastTested: Date.now(),
+      config,
+    }
+    logForDebugging('Ripgrep first use test: FAILED (mode=unavailable)')
+    logEvent('tengu_ripgrep_availability', {
+      working: 0,
+      using_system: 0,
+    })
+    return
+  }
 
   try {
     let test: { code: number; stdout: string }
@@ -676,4 +846,11 @@ async function codesignRipgrepIfNecessary() {
   } catch (e) {
     logError(e)
   }
+}
+
+export function resetRipgrepStateForTests(): void {
+  getRipgrepConfig.cache.clear?.()
+  testRipgrepOnFirstUse.cache.clear?.()
+  ripgrepStatus = null
+  alreadyDoneSignCheck = false
 }

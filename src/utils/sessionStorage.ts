@@ -80,6 +80,7 @@ import { gracefulShutdownSync, isShuttingDown } from './gracefulShutdown.js'
 import { parseJSONL } from './json.js'
 import { logError } from './log.js'
 import { extractTag, isCompactBoundaryMessage } from './messages.js'
+import type { ModelAlias } from './model/aliases.js'
 import { sanitizePath } from './path.js'
 import {
   extractJsonStringField,
@@ -263,12 +264,40 @@ function getAgentMetadataPath(agentId: AgentId): string {
 
 export type AgentMetadata = {
   agentType: string
+  /** Agent whose transcript owns this run's lifecycle. Absent for root runs
+   * and for metadata written before lifecycle ownership was persisted. */
+  ownerAgentId?: string
+  /** Per-invocation Agent tool model override. Retained across follow-ups. */
+  model?: ModelAlias
   /** Worktree path if the agent was spawned with isolation: "worktree" */
   worktreePath?: string
   /** Original task description from the AgentTool input. Persisted so a
    * resumed agent's notification can show the original description instead
    * of a placeholder. Optional — older metadata files lack this field. */
   description?: string
+  /** tool_use id of the Agent call that spawned this agent. Resume must
+   * re-attach the agent to that original card — the resuming tool (e.g.
+   * SendMessage) has its own tool_use id, and using it would file the
+   * agent's activity and completion under the wrong card. Optional —
+   * older metadata files lack this field. */
+  toolUseId?: string
+  /**
+   * Which workflow run and phase this agent belongs to.
+   *
+   * A workflow's shape — phases, and which agents ran in each — exists only in
+   * the live progress stream, so reopening a finished session had nothing to
+   * rebuild it from. This sidecar is written before the agent starts and
+   * outlives the process, which makes it the record. Absent for ordinary
+   * subagents and for workflow runs from before this was added.
+   */
+  workflow?: {
+    runId: string
+    name: string
+    phaseIndex: number
+    phaseTitle?: string
+    /** The runtime's sequential agent number within the run. */
+    agentIndex: number
+  }
 }
 
 /**
@@ -421,7 +450,10 @@ export function getUserType(): string {
 }
 
 function getEntrypoint(): string | undefined {
-  return process.env.CLAUDE_CODE_ENTRYPOINT
+  return (
+    process.env.CC_HAHA_TRANSCRIPT_ENTRYPOINT?.trim() ||
+    process.env.CLAUDE_CODE_ENTRYPOINT
+  )
 }
 
 export function isCustomTitleEnabled(): boolean {
@@ -485,6 +517,24 @@ export function resetProjectForTesting(): void {
 
 export function setSessionFileForTesting(path: string): void {
   getProject().sessionFile = path
+}
+
+/** @internal Test hook for flush races where tracked work enqueues late. */
+export async function enqueueSessionEntryAfterPendingForTesting(
+  path: string,
+  entry: Entry,
+  delayMs = 0,
+): Promise<void> {
+  const projectForTesting = getProject() as unknown as {
+    trackWrite<T>(fn: () => Promise<T>): Promise<T>
+    enqueueWrite(filePath: string, entry: Entry): Promise<void>
+  }
+  await projectForTesting.trackWrite(async () => {
+    if (delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs))
+    }
+    void projectForTesting.enqueueWrite(path, entry)
+  })
 }
 
 type InternalEventWriter = (
@@ -839,25 +889,36 @@ class Project {
   }
 
   async flush(): Promise<void> {
-    // Cancel pending timer
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer)
-      this.flushTimer = null
-    }
-    // Wait for any in-flight drain to finish
-    if (this.activeDrain) {
-      await this.activeDrain
-    }
-    // Drain anything remaining in the queues
-    await this.drainWriteQueue()
+    while (true) {
+      // Cancel pending timer so process shutdown does not wait for the next
+      // interval tick before draining already queued transcript writes.
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer)
+        this.flushTimer = null
+      }
 
-    // Wait for non-queue tracked operations (e.g. removeMessageByUuid)
-    if (this.pendingWriteCount === 0) {
-      return
+      // Wait for any in-flight drain to finish before taking ownership of the
+      // remaining queue.
+      if (this.activeDrain) {
+        await this.activeDrain
+      }
+
+      await this.drainWriteQueue()
+
+      if (this.pendingWriteCount === 0) {
+        // A tracked writer may have enqueued after the drain above and then
+        // completed. Loop once more so flush() only returns after that late
+        // enqueue has also been written.
+        if (!this.flushTimer && !this.activeDrain && this.writeQueues.size === 0) {
+          return
+        }
+        continue
+      }
+
+      await new Promise<void>(resolve => {
+        this.flushResolvers.push(resolve)
+      })
     }
-    return new Promise<void>(resolve => {
-      this.flushResolvers.push(resolve)
-    })
   }
 
   /**
@@ -4352,9 +4413,22 @@ export function isLoggableMessage(m: Message): boolean {
   if (m.type === 'progress') return false
   // IMPORTANT: We deliberately filter out most attachments for non-ants because
   // they have sensitive info for training that we don't want exposed to the public.
+  // Desktop sessions are the narrow exception: explicit file context must be
+  // present in the local transcript or --resume can only restore the @path and
+  // silently loses the content that the model saw before an app restart.
   // When enabled, we allow hook_additional_context through since it contains
   // user-configured hook output that is useful for session context on resume.
   if (m.type === 'attachment' && getUserType() !== 'ant') {
+    if (
+      getEntrypoint() === 'claude-desktop' &&
+      (
+        m.attachment.type === 'file' ||
+        m.attachment.type === 'directory' ||
+        m.attachment.type === 'pdf_reference'
+      )
+    ) {
+      return true
+    }
     if (
       m.attachment.type === 'hook_additional_context' &&
       isEnvTruthy(process.env.CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT)

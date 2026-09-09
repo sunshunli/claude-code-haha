@@ -1,11 +1,19 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { isRemoteManagedSettingsEligible } from '../services/remoteManagedSettings/syncCache.js'
+import {
+  activeProviderNeedsProxy,
+  mergeActiveProviderManagedEnv,
+} from '../server/services/providerRuntimeEnv.js'
+import { ensureStandaloneProviderProxy } from '../server/proxy/standaloneProviderProxy.js'
 import { clearCACertsCache } from './caCerts.js'
 import { getGlobalConfig } from './config.js'
-import { isEnvTruthy } from './envUtils.js'
+import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
 import {
   isProviderManagedEnvVar,
   SAFE_ENV_VARS,
 } from './managedEnvConstants.js'
+import { normalizeLegacyDeepSeekManagedEnv } from './providerManagedEnvCompat.js'
 import { clearMTLSCache } from './mtls.js'
 import { clearProxyCache, configureGlobalAgents } from './proxy.js'
 import { isSettingSourceEnabled } from './settings/constants.js'
@@ -58,6 +66,23 @@ function withoutHostManagedProviderVars(
   return out
 }
 
+const HOST_OWNED_ENV_KEYS = new Set([
+  'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+  'CC_HAHA_LOCAL_ACCESS_TOKEN',
+])
+
+function withoutHostOwnedEnvVars(
+  env: Record<string, string> | undefined,
+): Record<string, string> {
+  if (!env || !isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)) {
+    return env || {}
+  }
+
+  return Object.fromEntries(
+    Object.entries(env).filter(([key]) => !HOST_OWNED_ENV_KEYS.has(key)),
+  )
+}
+
 /**
  * Snapshot of env keys present before any settings.env is applied — for CCD,
  * these are the keys the desktop host set to orchestrate the subprocess.
@@ -86,8 +111,34 @@ function filterSettingsEnv(
   env: Record<string, string> | undefined,
 ): Record<string, string> {
   return withoutCcdSpawnEnvKeys(
-    withoutHostManagedProviderVars(withoutSSHTunnelVars(env)),
+    withoutHostOwnedEnvVars(
+      withoutHostManagedProviderVars(withoutSSHTunnelVars(env)),
+    ),
   )
+}
+
+/**
+ * Read env vars from ~/.claude/cc-haha/settings.json (Haha-specific provider
+ * config). This file is written by ProviderService.syncToSettings() and
+ * contains ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, model defaults, etc.
+ * Returns an empty object if the file doesn't exist or is invalid.
+ */
+function getCcHahaSettingsEnv(): Record<string, string> {
+  const configDir = getClaudeConfigHomeDir()
+  const serverPort =
+    !isEnvTruthy(process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST) &&
+    activeProviderNeedsProxy(configDir)
+      ? ensureStandaloneProviderProxy()
+      : undefined
+  try {
+    const ccHahaSettings = join(configDir, 'cc-haha', 'settings.json')
+    const raw = readFileSync(ccHahaSettings, 'utf-8')
+    const parsed = JSON.parse(raw) as { env?: Record<string, string> }
+    const settingsEnv = normalizeLegacyDeepSeekManagedEnv(parsed.env ?? {}).env
+    return mergeActiveProviderManagedEnv(settingsEnv, configDir, { serverPort })
+  } catch {
+    return mergeActiveProviderManagedEnv({}, configDir, { serverPort })
+  }
 }
 
 /**
@@ -148,6 +199,12 @@ export function applySafeConfigEnvironmentVariables(): void {
     )
   }
 
+  // cc-haha provider isolation: apply env from ~/.claude/cc-haha/settings.json
+  // AFTER userSettings so Haha-specific provider config takes priority over
+  // the original Claude Code's settings. This prevents Haha from polluting
+  // ~/.claude/settings.json while still allowing it to override provider vars.
+  Object.assign(process.env, filterSettingsEnv(getCcHahaSettingsEnv()))
+
   // Compute remote-managed-settings eligibility now, with userSettings and
   // flagSettings env applied. Eligibility reads CLAUDE_CODE_USE_BEDROCK,
   // ANTHROPIC_BASE_URL — both settable via settings.env.
@@ -188,6 +245,10 @@ export function applyConfigEnvironmentVariables(): void {
   Object.assign(process.env, filterSettingsEnv(getGlobalConfig().env))
 
   Object.assign(process.env, filterSettingsEnv(getSettings_DEPRECATED()?.env))
+
+  // cc-haha provider isolation: same as in applySafeConfigEnvironmentVariables,
+  // apply Haha-specific env last so it overrides the original settings.
+  Object.assign(process.env, filterSettingsEnv(getCcHahaSettingsEnv()))
 
   // Clear caches so agents are rebuilt with the new env vars
   clearCACertsCache()

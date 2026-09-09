@@ -8,6 +8,7 @@ import type {
   BetaStopReason,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { AFK_MODE_BETA_HEADER } from 'src/constants/betas.js'
+import { BUSINESS_ERROR_CODES } from 'src/constants/businessErrors.js'
 import type { SDKAssistantMessageError } from 'src/entrypoints/agentSdkTypes.js'
 import type {
   AssistantMessage,
@@ -50,6 +51,7 @@ import {
 } from '../claudeAiLimits.js'
 import { shouldProcessRateLimits } from '../rateLimitMocking.js' // Used for /mock-limits command
 import { extractConnectionErrorDetails, formatAPIError } from './errorUtils.js'
+import { StreamWatchdogTimeoutError } from './streamWatchdog.js'
 
 export const API_ERROR_MESSAGE_PREFIX = 'API Error'
 
@@ -60,6 +62,28 @@ export function startsWithApiErrorPrefix(text: string): boolean {
   )
 }
 export const PROMPT_TOO_LONG_ERROR_MESSAGE = 'Prompt is too long'
+
+/**
+ * Providers word context-overflow rejections differently, and some gateways
+ * even wrap them in a 401 (e.g. Kimi's "k3-256k supports only 256K context").
+ * Anything matched here is normalized to PROMPT_TOO_LONG_ERROR_MESSAGE so the
+ * compact retry loop and the UI can key on one string — without this, a
+ * third-party overflow surfaces as "Please run /login" and the session is
+ * unrecoverable (#1162).
+ */
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+  /prompt is too long/i,
+  /input is too long for requested model/i,
+  /context_length_exceeded/i,
+  /maximum context length/i,
+  /exceeds? the context window/i,
+  /context window exceeded/i,
+  /supports only \d+\s*k?\s*(?:tokens?\s+of\s+)?context/i,
+]
+
+export function isContextOverflowErrorText(text: string): boolean {
+  return CONTEXT_OVERFLOW_PATTERNS.some(pattern => pattern.test(text))
+}
 
 export function isPromptTooLongMessage(msg: AssistantMessage): boolean {
   if (!msg.isApiErrorMessage) {
@@ -187,6 +211,11 @@ export function getImageTooLargeErrorMessage(): string {
   return getIsNonInteractiveSession()
     ? 'Image was too large. Try resizing the image or using a different approach.'
     : 'Image was too large. Double press esc to go back and try again with a smaller image.'
+}
+export function getImageUnsupportedErrorMessage(): string {
+  return getIsNonInteractiveSession()
+    ? 'This model does not support images. Continue with text, or switch to a vision-capable model and send the image again.'
+    : 'This model does not support images. Double press esc to go back, switch to a vision-capable model, or continue with text.'
 }
 export function getRequestTooLargeErrorMessage(): string {
   const limits = `max ${formatFileSize(PDF_TARGET_RAW_SIZE)}`
@@ -422,6 +451,48 @@ export function extractUnknownErrorFormat(value: unknown): string | undefined {
   return undefined
 }
 
+export function isUnsupportedImageInputErrorMessage(message: string): boolean {
+  const raw = message.toLowerCase()
+  if (!raw.includes('image')) return false
+  if (isOpenAIImageUrlTextOnlySchemaError(raw)) {
+    return true
+  }
+  return (
+    raw.includes('not support') ||
+    raw.includes('not supported') ||
+    raw.includes('unsupported') ||
+    raw.includes('vision') ||
+    raw.includes('multimodal') ||
+    raw.includes('multi-modal') ||
+    raw.includes('modality')
+  )
+}
+
+function isOpenAIImageUrlTextOnlySchemaError(raw: string): boolean {
+  if (!raw.includes('image_url')) return false
+  if (
+    raw.includes('not allowed') ||
+    raw.includes('not permitted') ||
+    raw.includes('disallowed') ||
+    raw.includes('forbidden')
+  ) {
+    return true
+  }
+  if (!raw.includes('text')) return false
+  return (
+    raw.includes('expected') ||
+    raw.includes('input should be') ||
+    raw.includes('not one of') ||
+    raw.includes('permitted') ||
+    raw.includes('received') ||
+    raw.includes('unknown variant') ||
+    raw.includes('invalid value') ||
+    raw.includes('invalid type') ||
+    raw.includes('valid enumeration') ||
+    raw.includes('only text')
+  )
+}
+
 export function getAssistantMessageFromError(
   error: unknown,
   model: string,
@@ -448,6 +519,24 @@ export function getAssistantMessageFromError(
   if (error instanceof ImageSizeError || error instanceof ImageResizeError) {
     return createAssistantAPIErrorMessage({
       content: getImageTooLargeErrorMessage(),
+      businessErrorCode: BUSINESS_ERROR_CODES.IMAGE_TOO_LARGE,
+    })
+  }
+
+  // Custom/Anthropic-compatible providers often reject image blocks with
+  // provider-specific wording when the selected model is text-only. Convert it
+  // to a known synthetic error so normalizeMessagesForAPI can strip the image
+  // from later turns instead of poisoning the whole session.
+  if (
+    error instanceof Error &&
+    isUnsupportedImageInputErrorMessage(error.message) &&
+    (!(error instanceof APIError) || error.status === 400 || error.status === 422)
+  ) {
+    return createAssistantAPIErrorMessage({
+      content: getImageUnsupportedErrorMessage(),
+      error: 'invalid_request',
+      errorDetails: error.message,
+      businessErrorCode: BUSINESS_ERROR_CODES.IMAGE_UNSUPPORTED,
     })
   }
 
@@ -557,12 +646,11 @@ export function getAssistantMessageFromError(
     })
   }
 
-  // Handle prompt too long errors (Vertex returns 413, direct API returns 400)
-  // Use case-insensitive check since Vertex returns "Prompt is too long" (capitalized)
-  if (
-    error instanceof Error &&
-    error.message.toLowerCase().includes('prompt is too long')
-  ) {
+  // Handle context-overflow errors (Vertex returns 413, direct API returns
+  // 400, some third-party gateways wrap them in a 401 with their own wording).
+  // This must stay ahead of the generic 401 handler below so a wrapped
+  // overflow isn't misreported as an authentication failure.
+  if (error instanceof Error && isContextOverflowErrorText(error.message)) {
     // Content stays generic (UI matches on exact string). The raw error with
     // token counts goes into errorDetails — reactive compact's retry loop
     // parses the gap from there via getPromptTooLongTokenGap.
@@ -570,6 +658,7 @@ export function getAssistantMessageFromError(
       content: PROMPT_TOO_LONG_ERROR_MESSAGE,
       error: 'invalid_request',
       errorDetails: error.message,
+      businessErrorCode: BUSINESS_ERROR_CODES.PROMPT_TOO_LONG,
     })
   }
 
@@ -582,6 +671,7 @@ export function getAssistantMessageFromError(
       content: getPdfTooLargeErrorMessage(),
       error: 'invalid_request',
       errorDetails: error.message,
+      businessErrorCode: BUSINESS_ERROR_CODES.PDF_TOO_LARGE,
     })
   }
 
@@ -593,6 +683,7 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       content: getPdfPasswordProtectedErrorMessage(),
       error: 'invalid_request',
+      businessErrorCode: BUSINESS_ERROR_CODES.PDF_PASSWORD_PROTECTED,
     })
   }
 
@@ -606,6 +697,7 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       content: getPdfInvalidErrorMessage(),
       error: 'invalid_request',
+      businessErrorCode: BUSINESS_ERROR_CODES.PDF_INVALID,
     })
   }
 
@@ -619,6 +711,7 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       content: getImageTooLargeErrorMessage(),
       errorDetails: error.message,
+      businessErrorCode: BUSINESS_ERROR_CODES.IMAGE_TOO_LARGE,
     })
   }
 
@@ -635,6 +728,7 @@ export function getAssistantMessageFromError(
         : 'An image in the conversation exceeds the dimension limit for many-image requests (2000px). Run /compact to remove old images from context, or start a new session.',
       error: 'invalid_request',
       errorDetails: error.message,
+      businessErrorCode: BUSINESS_ERROR_CODES.IMAGE_TOO_LARGE,
     })
   }
 
@@ -651,6 +745,7 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       content: 'Auto mode is unavailable for your plan',
       error: 'invalid_request',
+      businessErrorCode: BUSINESS_ERROR_CODES.AUTO_MODE_UNAVAILABLE,
     })
   }
 
@@ -660,6 +755,7 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       content: getRequestTooLargeErrorMessage(),
       error: 'invalid_request',
+      businessErrorCode: BUSINESS_ERROR_CODES.REQUEST_TOO_LARGE,
     })
   }
 
@@ -913,6 +1009,14 @@ export function getAssistantMessageFromError(
     })
   }
 
+  if (error instanceof StreamWatchdogTimeoutError) {
+    return createAssistantAPIErrorMessage({
+      content: `${API_ERROR_MESSAGE_PREFIX}: ${error.message}`,
+      error: 'server_error',
+      errorDetails: JSON.stringify(error.toDiagnosticData()),
+    })
+  }
+
   // Connection errors (non-timeout) — use formatAPIError for detailed messages
   if (error instanceof APIConnectionError) {
     return createAssistantAPIErrorMessage({
@@ -943,7 +1047,7 @@ function get3PModelFallbackSuggestion(model: string): string | undefined {
   }
   // @[MODEL LAUNCH]: Add a fallback suggestion chain for the new model → previous version for 3P
   const m = model.toLowerCase()
-  // If the failing model looks like an Opus 4.6 variant, suggest the default Opus (4.1 for 3P)
+  // If the failing model looks like an Opus 4.7 variant, suggest the default Opus (4.1 for 3P)
   if (m.includes('opus-4-6') || m.includes('opus_4_6')) {
     return getModelStrings().opus41
   }

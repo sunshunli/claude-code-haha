@@ -6,6 +6,7 @@ import btw from './commands/btw/index.js'
 import goodClaude from './commands/good-claude/index.js'
 import issue from './commands/issue/index.js'
 import feedback from './commands/feedback/index.js'
+import goal from './commands/goal/index.js'
 import clear from './commands/clear/index.js'
 import color from './commands/color/index.js'
 import commit from './commands/commit.js'
@@ -43,6 +44,7 @@ import share from './commands/share/index.js'
 import skills from './commands/skills/index.js'
 import status from './commands/status/index.js'
 import tasks from './commands/tasks/index.js'
+import team from './commands/team.js'
 import teleport from './commands/teleport/index.js'
 /* eslint-disable @typescript-eslint/no-require-imports */
 const agentsPlatform =
@@ -83,11 +85,9 @@ const voiceCommand = feature('VOICE_MODE')
 const forceSnip = feature('HISTORY_SNIP')
   ? require('./commands/force-snip.js').default
   : null
-const workflowsCmd = feature('WORKFLOW_SCRIPTS')
-  ? (
-      require('./commands/workflows/index.js') as typeof import('./commands/workflows/index.js')
-    ).default
-  : null
+const workflowsCmd = (
+  require('./commands/workflows/index.js') as typeof import('./commands/workflows/index.js')
+).default
 const webCmd = feature('CCR_REMOTE_SETUP')
   ? (
       require('./commands/remote-setup/index.js') as typeof import('./commands/remote-setup/index.js')
@@ -129,6 +129,7 @@ import privacySettings from './commands/privacy-settings/index.js'
 import hooks from './commands/hooks/index.js'
 import files from './commands/files/index.js'
 import branch from './commands/branch/index.js'
+import agent from './commands/agent.js'
 import agents from './commands/agents/index.js'
 import plugin from './commands/plugin/index.js'
 import reloadPlugins from './commands/reload-plugins/index.js'
@@ -157,6 +158,7 @@ import {
   getDynamicSkills,
 } from './skills/loadSkillsDir.js'
 import { getBundledSkills } from './skills/bundledSkills.js'
+import { initBundledSkills } from './skills/bundled/index.js'
 import { getBuiltinPluginSkillCommands } from './plugins/builtinPlugins.js'
 import {
   getPluginCommands,
@@ -256,6 +258,7 @@ export const INTERNAL_ONLY_COMMANDS = [
 const COMMANDS = memoize((): Command[] => [
   addDir,
   advisor,
+  agent,
   agents,
   branch,
   btw,
@@ -301,8 +304,10 @@ const COMMANDS = memoize((): Command[] => [
   statusline,
   stickers,
   tag,
+  team,
   theme,
   feedback,
+  goal,
   review,
   ultrareview,
   rewind,
@@ -347,6 +352,44 @@ export const builtInCommandNames = memoize(
   (): Set<string> =>
     new Set(COMMANDS().flatMap(_ => [_.name, ...(_.aliases ?? [])])),
 )
+
+/**
+ * The commands that live inside the binary — built-ins plus bundled skills —
+ * with no disk or network work of any kind.
+ *
+ * The desktop server answers `GET /slash-commands` for sessions whose CLI
+ * subprocess has not started yet, and it can only scan directories. Everything
+ * compiled in was therefore missing from a new session's slash menu — which is
+ * precisely when a user opens that menu. See listSkillSlashCommands().
+ *
+ * Availability and isEnabled are evaluated on every call, exactly as
+ * getCommands() does, so a feature the user has switched off stays hidden.
+ */
+export function getCompiledInCommands(): Command[] {
+  // The CLI registers these during startup; the server process never runs that
+  // path. Registration appends, so only initialize an empty registry.
+  if (getBundledSkills().length === 0) {
+    initBundledSkills()
+  }
+  const commands: Command[] = [...getBundledSkills()]
+
+  try {
+    commands.push(...COMMANDS())
+  } catch (err) {
+    // Building the built-in table reads auth state, so it throws when nobody
+    // has signed in yet. Bundled skills need no credentials — dropping them
+    // alongside the built-ins would empty a new user's slash menu completely.
+    logForDebugging(
+      `Built-in commands unavailable, listing bundled skills only: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    )
+  }
+
+  return commands.filter(
+    _ => meetsAvailabilityRequirement(_) && isCommandEnabled(_),
+  )
+}
 
 async function getSkills(cwd: string): Promise<{
   skillDirCommands: Command[]
@@ -396,11 +439,9 @@ async function getSkills(cwd: string): Promise<{
 }
 
 /* eslint-disable @typescript-eslint/no-require-imports */
-const getWorkflowCommands = feature('WORKFLOW_SCRIPTS')
-  ? (
-      require('./tools/WorkflowTool/createWorkflowCommand.js') as typeof import('./tools/WorkflowTool/createWorkflowCommand.js')
-    ).getWorkflowCommands
-  : null
+const getWorkflowCommands = (
+  require('./tools/WorkflowTool/createWorkflowCommand.js') as typeof import('./tools/WorkflowTool/createWorkflowCommand.js')
+).getWorkflowCommands
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 /**

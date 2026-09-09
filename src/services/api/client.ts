@@ -1,4 +1,5 @@
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk'
+import { normalizeAnthropicBaseUrl } from './anthropicBaseUrl.js'
 import { randomUUID } from 'crypto'
 import type { GoogleAuth } from 'google-auth-library'
 import {
@@ -10,6 +11,7 @@ import {
   refreshAndGetAwsCredentials,
   refreshGcpCredentialsIfNeeded,
 } from 'src/utils/auth.js'
+import { signClaudeCodeCCHBody } from 'src/utils/claudeCodeCch.js'
 import { getUserAgent } from 'src/utils/http.js'
 import { getSmallFastModel } from 'src/utils/model/model.js'
 import {
@@ -22,6 +24,17 @@ import {
   getSessionId,
 } from '../../bootstrap/state.js'
 import { getOauthConfig } from '../../constants/oauth.js'
+import {
+  buildOpenAICodexFetch,
+  OPENAI_OAUTH_DUMMY_KEY,
+  shouldUseOpenAICodexAuth,
+} from '../openaiAuth/fetch.js'
+import { isOpenAIResponsesModel } from '../openaiAuth/models.js'
+import {
+  buildGrokFetch,
+  GROK_OAUTH_DUMMY_KEY,
+  shouldUseGrokAuth,
+} from '../grokAuth/fetch.js'
 import { isDebugToStdErr, logForDebugging } from '../../utils/debug.js'
 import {
   getAWSRegion,
@@ -85,6 +98,106 @@ function createStderrLogger(): ClientOptions['logger'] {
   }
 }
 
+export function resolveAnthropicClientApiKey({
+  explicitApiKey,
+  envAuthToken = process.env.ANTHROPIC_AUTH_TOKEN,
+  envApiKey = process.env.ANTHROPIC_API_KEY,
+  getFallbackApiKey = getAnthropicApiKey,
+}: {
+  explicitApiKey?: string
+  envAuthToken?: string
+  envApiKey?: string
+  getFallbackApiKey?: () => string | null
+}): string | null {
+  if (envAuthToken && !explicitApiKey && !envApiKey) {
+    return null
+  }
+
+  return explicitApiKey || getFallbackApiKey()
+}
+
+export function resolveManagedProviderProxyAccessToken({
+  providerManagedByHost = process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST,
+  apiKey = process.env.ANTHROPIC_API_KEY,
+  baseUrl = process.env.ANTHROPIC_BASE_URL,
+  localAccessToken = process.env.CC_HAHA_LOCAL_ACCESS_TOKEN,
+  requestUrl = baseUrl,
+}: {
+  providerManagedByHost?: string
+  apiKey?: string
+  baseUrl?: string
+  localAccessToken?: string
+  requestUrl?: string
+} = {}): string | null {
+  const token = localAccessToken?.trim()
+  if (
+    !isEnvTruthy(providerManagedByHost) ||
+    apiKey !== 'proxy-managed' ||
+    !baseUrl ||
+    !token
+  ) {
+    return null
+  }
+
+  try {
+    const base = new URL(baseUrl)
+    const request = new URL(requestUrl || baseUrl)
+    const basePathname = base.pathname.replace(/\/+$/, '') || '/'
+    const requestPathname = request.pathname.replace(/\/+$/, '') || '/'
+    const isManagedProxyPath = basePathname === '/proxy' ||
+      /^\/proxy\/providers\/[^/]+$/.test(basePathname)
+    const isRequestWithinProxy = request.origin === base.origin &&
+      (
+        requestPathname === basePathname ||
+        requestPathname.startsWith(`${basePathname}/`)
+      )
+
+    if (
+      base.protocol !== 'http:' ||
+      base.hostname !== '127.0.0.1' ||
+      base.username ||
+      base.password ||
+      base.search ||
+      base.hash ||
+      request.username ||
+      request.password ||
+      !isManagedProxyPath ||
+      !isRequestWithinProxy
+    ) {
+      return null
+    }
+  } catch {
+    return null
+  }
+
+  return token
+}
+
+export function shouldUseOpenAICodexTransport({
+  hasOpenAIAuth,
+  isClaudeSubscriber,
+  forceOpenAICodex,
+  isOpenAIModel,
+  hasAnthropicAuthToken,
+  hasExplicitApiKey,
+  hasFallbackApiKey,
+}: {
+  hasOpenAIAuth: boolean
+  isClaudeSubscriber: boolean
+  forceOpenAICodex: boolean
+  isOpenAIModel: boolean
+  hasAnthropicAuthToken: boolean
+  hasExplicitApiKey: boolean
+  hasFallbackApiKey: boolean
+}): boolean {
+  return (
+    hasOpenAIAuth &&
+    (!isClaudeSubscriber || forceOpenAICodex) &&
+    (isOpenAIModel ||
+      (!hasAnthropicAuthToken && !hasExplicitApiKey && !hasFallbackApiKey))
+  )
+}
+
 export async function getAnthropicClient({
   apiKey,
   maxRetries,
@@ -132,11 +245,40 @@ export async function getAnthropicClient({
   await checkAndRefreshOAuthTokenIfNeeded()
   logForDebugging('[API:auth] OAuth token check complete')
 
-  if (!isClaudeAISubscriber()) {
+  const isOpenAIModel = model ? isOpenAIResponsesModel(model) : false
+  const forceOpenAICodex = isEnvTruthy(process.env.CC_HAHA_OPENAI_OAUTH_PROVIDER)
+  const forceGrok = isEnvTruthy(process.env.CC_HAHA_GROK_OAUTH_PROVIDER)
+  const isClaudeSubscriber = forceGrok ? false : isClaudeAISubscriber()
+  const hasOpenAIAuth = shouldUseOpenAICodexAuth()
+  const usingGrok = forceGrok && shouldUseGrokAuth()
+  const hasFallbackApiKey = hasOpenAIAuth &&
+    !process.env.ANTHROPIC_AUTH_TOKEN &&
+    !apiKey &&
+    !!getAnthropicApiKey()
+  const usingOpenAICodex = shouldUseOpenAICodexTransport({
+    hasOpenAIAuth,
+    isClaudeSubscriber,
+    forceOpenAICodex,
+    isOpenAIModel,
+    hasAnthropicAuthToken: !!process.env.ANTHROPIC_AUTH_TOKEN,
+    hasExplicitApiKey: !!apiKey,
+    hasFallbackApiKey,
+  })
+
+  if (!isClaudeSubscriber && !usingOpenAICodex && !usingGrok) {
     await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
   }
 
-  const resolvedFetch = buildFetch(fetchOverride, source)
+  const resolvedFetch = usingGrok
+    ? buildGrokFetch(fetchOverride, source)
+    : usingOpenAICodex
+      ? buildOpenAICodexFetch(fetchOverride, source)
+      : buildFetch(fetchOverride, source)
+  const stagingOAuthBaseUrl = process.env.USER_TYPE === 'ant' &&
+    isEnvTruthy(process.env.USE_STAGING_OAUTH)
+    ? getOauthConfig().BASE_API_URL
+    : undefined
+  const baseURL = stagingOAuthBaseUrl || process.env.ANTHROPIC_BASE_URL
 
   const ARGS = {
     defaultHeaders,
@@ -145,6 +287,7 @@ export async function getAnthropicClient({
     dangerouslyAllowBrowser: true,
     fetchOptions: getProxyFetchOptions({
       forAnthropicAPI: true,
+      targetUrl: baseURL,
     }) as ClientOptions['fetchOptions'],
     ...(resolvedFetch && {
       fetch: resolvedFetch,
@@ -299,15 +442,18 @@ export async function getAnthropicClient({
 
   // Determine authentication method based on available tokens
   const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
-    apiKey: isClaudeAISubscriber() ? null : apiKey || getAnthropicApiKey(),
-    authToken: isClaudeAISubscriber()
+    apiKey: usingOpenAICodex
+      ? OPENAI_OAUTH_DUMMY_KEY
+      : usingGrok
+        ? GROK_OAUTH_DUMMY_KEY
+      : isClaudeSubscriber
+        ? null
+        : resolveAnthropicClientApiKey({ explicitApiKey: apiKey }),
+    authToken: isClaudeSubscriber && !usingOpenAICodex && !usingGrok
       ? getClaudeAIOAuthTokens()?.accessToken
       : undefined,
-    // Set baseURL from OAuth config when using staging OAuth
-    ...(process.env.USER_TYPE === 'ant' &&
-    isEnvTruthy(process.env.USE_STAGING_OAUTH)
-      ? { baseURL: getOauthConfig().BASE_API_URL }
-      : {}),
+    // The SDK appends /v1 to every API path, including messages and token counts.
+    ...(baseURL ? { baseURL: normalizeAnthropicBaseUrl(baseURL) } : {}),
     ...ARGS,
     ...(isDebugToStdErr() && { logger: createStderrLogger() }),
   }
@@ -368,6 +514,15 @@ function buildFetch(
   return (input, init) => {
     // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
     const headers = new Headers(init?.headers)
+    // Authenticate only the exact host-managed loopback proxy request. Doing
+    // this at the final fetch seam prevents request-level headers from replacing
+    // the desktop credential and prevents that credential from reaching the
+    // real provider; the server adds the upstream provider key itself.
+    const requestUrl = input instanceof Request ? input.url : String(input)
+    const localProxyToken = resolveManagedProviderProxyAccessToken({ requestUrl })
+    if (localProxyToken) {
+      headers.set('Authorization', `Bearer ${localProxyToken}`)
+    }
     // Generate a client-side request ID so timeouts (which return no server
     // request ID) can still be correlated with server logs by the API team.
     // Callers that want to track the ID themselves can pre-set the header.
@@ -375,15 +530,13 @@ function buildFetch(
       headers.set(CLIENT_REQUEST_ID_HEADER, randomUUID())
     }
     try {
-      // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
-      const url = input instanceof Request ? input.url : String(input)
       const id = headers.get(CLIENT_REQUEST_ID_HEADER)
       logForDebugging(
-        `[API REQUEST] ${new URL(url).pathname}${id ? ` ${CLIENT_REQUEST_ID_HEADER}=${id}` : ''} source=${source ?? 'unknown'}`,
+        `[API REQUEST] ${new URL(requestUrl).pathname}${id ? ` ${CLIENT_REQUEST_ID_HEADER}=${id}` : ''} source=${source ?? 'unknown'}`,
       )
     } catch {
       // never let logging crash the fetch
     }
-    return inner(input, { ...init, headers })
+    return inner(input, { ...init, headers, body: signClaudeCodeCCHBody(init?.body) })
   }
 }

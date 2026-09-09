@@ -10,14 +10,15 @@
 //   { "tasks": [{ id, cron, prompt, createdAt, recurring?, permanent? }] }
 
 import { randomUUID } from 'crypto'
-import { readFileSync } from 'fs'
-import { mkdir, writeFile } from 'fs/promises'
+import { readFileSync, type Stats } from 'fs'
+import { lstat, mkdir, rename, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import {
   addSessionCronTask,
   getProjectRoot,
   getSessionCronTasks,
   removeSessionCronTasks,
+  setScheduledTasksEnabled,
 } from '../bootstrap/state.js'
 import { computeNextCronRun, parseCronExpression } from './cron.js'
 import { logForDebugging } from './debug.js'
@@ -57,8 +58,8 @@ export type CronTask = {
   permanent?: boolean
   /**
    * Runtime-only flag. false → session-scoped (never written to disk).
-   * File-backed tasks leave this undefined; writeCronTasks strips it so
-   * the on-disk shape stays { id, cron, prompt, createdAt, lastFiredAt?, recurring?, permanent? }.
+   * File-backed tasks leave this undefined; writeCronTasks strips it
+   * (along with agentId) so neither appears in the on-disk JSON.
    */
   durable?: boolean
   /**
@@ -67,6 +68,37 @@ export type CronTask = {
    * REPL's. Never written to disk (teammate crons are always session-only).
    */
   agentId?: string
+  /** Human-readable task name (e.g. "daily-code-review"). */
+  name?: string
+  /** Task description (e.g. "Review yesterday's commits"). */
+  description?: string
+  /** Working directory for the task execution. */
+  folder?: string
+  /** Model to use (e.g. "claude-opus-4-7", "claude-sonnet-4-6"). */
+  model?: string
+  /** Desktop provider ID for the selected model; null means official. */
+  providerId?: string | null
+  /** Permission mode: "ask" | "auto-accept" | "plan" | "bypass". */
+  permissionMode?: string
+  /** Whether to use git worktree for execution. */
+  worktree?: boolean
+  /** Schedule frequency for UI display: "manual" | "hourly" | "daily" | "weekdays" | "weekly". */
+  frequency?: string
+  /** Time string for scheduled execution (e.g. "09:00") — UI helper for daily/weekdays/weekly. */
+  scheduledTime?: string
+}
+
+/** Optional metadata fields for scheduled tasks (UI-driven creation). */
+export type CronTaskMeta = {
+  name?: string
+  description?: string
+  folder?: string
+  model?: string
+  providerId?: string | null
+  permissionMode?: string
+  worktree?: boolean
+  frequency?: string
+  scheduledTime?: string
 }
 
 type CronFile = { tasks: CronTask[] }
@@ -134,6 +166,23 @@ export async function readCronTasks(dir?: string): Promise<CronTask[]> {
         : {}),
       ...(t.recurring ? { recurring: true } : {}),
       ...(t.permanent ? { permanent: true } : {}),
+      ...(typeof t.name === 'string' ? { name: t.name } : {}),
+      ...(typeof t.description === 'string'
+        ? { description: t.description }
+        : {}),
+      ...(typeof t.folder === 'string' ? { folder: t.folder } : {}),
+      ...(typeof t.model === 'string' ? { model: t.model } : {}),
+      ...(typeof t.providerId === 'string' || t.providerId === null
+        ? { providerId: t.providerId }
+        : {}),
+      ...(typeof t.permissionMode === 'string'
+        ? { permissionMode: t.permissionMode }
+        : {}),
+      ...(typeof t.worktree === 'boolean' ? { worktree: t.worktree } : {}),
+      ...(typeof t.frequency === 'string' ? { frequency: t.frequency } : {}),
+      ...(typeof t.scheduledTime === 'string'
+        ? { scheduledTime: t.scheduledTime }
+        : {}),
     })
   }
   return out
@@ -167,18 +216,75 @@ export async function writeCronTasks(
   dir?: string,
 ): Promise<void> {
   const root = dir ?? getProjectRoot()
-  await mkdir(join(root, '.claude'), { recursive: true })
-  // Strip the runtime-only `durable` flag — everything on disk is durable
-  // by definition, and keeping the flag out means readCronTasks() naturally
-  // yields durable: undefined without having to set it explicitly.
+  const claudeDir = join(root, '.claude')
+  await mkdir(claudeDir, { recursive: true })
+  const originalDirectoryStats = await assertSafeCronDirectory(claudeDir)
+  // Strip runtime-only flags — everything on disk is durable by definition,
+  // and agentId is session-scoped (teammates don't persist across sessions).
   const body: CronFile = {
-    tasks: tasks.map(({ durable: _durable, ...rest }) => rest),
+    tasks: tasks.map(({ durable: _durable, agentId: _agentId, ...rest }) => rest),
   }
-  await writeFile(
-    getCronFilePath(root),
-    jsonStringify(body, null, 2) + '\n',
-    'utf-8',
+  const targetPath = getCronFilePath(root)
+  const temporaryPath = join(
+    claudeDir,
+    `.scheduled_tasks.${process.pid}.${randomUUID()}.tmp`,
   )
+  try {
+    await writeFile(temporaryPath, jsonStringify(body, null, 2) + '\n', {
+      encoding: 'utf-8',
+      flag: 'wx',
+      mode: 0o600,
+    })
+    await assertSameCronDirectory(claudeDir, originalDirectoryStats)
+    await rename(temporaryPath, targetPath)
+    await assertSameCronDirectory(claudeDir, originalDirectoryStats)
+  } catch (error) {
+    if (
+      await isSameCronDirectory(claudeDir, originalDirectoryStats)
+    ) {
+      await unlink(temporaryPath).catch(() => {})
+    }
+    throw error
+  }
+}
+
+async function assertSafeCronDirectory(claudeDir: string): Promise<Stats> {
+  const stats = await lstat(claudeDir)
+  if (stats.isSymbolicLink()) {
+    throw new Error(
+      `Refusing to write scheduled tasks through symbolic link: ${claudeDir}`,
+    )
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(
+      `Refusing to write scheduled tasks because the path is not a directory: ${claudeDir}`,
+    )
+  }
+  return stats
+}
+
+async function assertSameCronDirectory(
+  claudeDir: string,
+  expected: Stats,
+): Promise<void> {
+  const current = await assertSafeCronDirectory(claudeDir)
+  if (current.dev !== expected.dev || current.ino !== expected.ino) {
+    throw new Error(
+      `Refusing to write scheduled tasks because the directory changed: ${claudeDir}`,
+    )
+  }
+}
+
+async function isSameCronDirectory(
+  claudeDir: string,
+  expected: Stats,
+): Promise<boolean> {
+  try {
+    await assertSameCronDirectory(claudeDir, expected)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -197,16 +303,30 @@ export async function addCronTask(
   recurring: boolean,
   durable: boolean,
   agentId?: string,
+  meta?: CronTaskMeta,
 ): Promise<string> {
   // Short ID — 8 hex chars is plenty for MAX_JOBS=50, avoids slice/prefix
   // juggling between the tool layer (shows short IDs) and disk.
   const id = randomUUID().slice(0, 8)
-  const task = {
+  const task: CronTask = {
     id,
     cron,
     prompt,
     createdAt: Date.now(),
     ...(recurring ? { recurring: true } : {}),
+    ...(meta?.name ? { name: meta.name } : {}),
+    ...(meta?.description ? { description: meta.description } : {}),
+    ...(meta?.folder ? { folder: meta.folder } : {}),
+    ...(meta?.model ? { model: meta.model } : {}),
+    ...(typeof meta?.providerId === 'string' || meta?.providerId === null
+      ? { providerId: meta.providerId }
+      : {}),
+    ...(meta?.permissionMode
+      ? { permissionMode: meta.permissionMode }
+      : {}),
+    ...(meta?.worktree !== undefined ? { worktree: meta.worktree } : {}),
+    ...(meta?.frequency ? { frequency: meta.frequency } : {}),
+    ...(meta?.scheduledTime ? { scheduledTime: meta.scheduledTime } : {}),
   }
   if (!durable) {
     addSessionCronTask({ ...task, ...(agentId ? { agentId } : {}) })
@@ -293,6 +413,42 @@ export async function listAllCronTasks(dir?: string): Promise<CronTask[]> {
     durable: false as const,
   }))
   return [...fileTasks, ...sessionTasks]
+}
+
+/**
+ * Update fields of an existing task by id. Searches both the in-memory
+ * session store and the on-disk file. Returns true if the task was found
+ * and updated, false if no task with that id exists.
+ *
+ * When `dir` is undefined (REPL path), tries the session store first;
+ * if the id isn't there, falls through to disk.
+ */
+export async function updateCronTask(
+  id: string,
+  updates: Partial<Omit<CronTask, 'id' | 'createdAt'>>,
+  dir?: string,
+): Promise<boolean> {
+  // Try session store first (REPL path only).
+  if (dir === undefined) {
+    const sessionTasks = getSessionCronTasks()
+    const sessionTask = sessionTasks.find(t => t.id === id)
+    if (sessionTask) {
+      Object.assign(sessionTask, updates)
+      // Re-signal the scheduler so it recalculates nextFireAt from the
+      // potentially-changed cron expression. The scheduler polls this flag.
+      setScheduledTasksEnabled(true)
+      return true
+    }
+  }
+
+  // Fall through to disk.
+  const tasks = await readCronTasks(dir)
+  const task = tasks.find(t => t.id === id)
+  if (!task) return false
+
+  Object.assign(task, updates)
+  await writeCronTasks(tasks, dir)
+  return true
 }
 
 /**

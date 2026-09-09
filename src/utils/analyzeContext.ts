@@ -19,6 +19,8 @@ import {
   countMessagesTokensWithAPI,
   countTokensViaHaikuFallback,
   roughTokenCountEstimation,
+  roughTokenCountEstimationForAPIRequest,
+  roughTokenCountEstimationForContent,
 } from '../services/tokenEstimation.js'
 import { estimateSkillFrontmatterTokens } from '../skills/loadSkillsDir.js'
 import {
@@ -48,19 +50,27 @@ import type {
 } from '../types/message.js'
 import { toolToAPISchema } from './api.js'
 import { filterInjectedMemoryFiles, getMemoryFiles } from './claudemd.js'
-import { getContextWindowForModel } from './context.js'
+import {
+  calculateCurrentContextTokenTotal,
+  getContextWindowForModel,
+} from './context.js'
+import { getProviderUsageTrust, hasMediaInput } from './contextBudget.js'
 import { getCwd } from './cwd.js'
 import { logForDebugging } from './debug.js'
 import { isEnvTruthy } from './envUtils.js'
 import { errorMessage, toError } from './errors.js'
 import { logError } from './log.js'
-import { normalizeMessagesForAPI } from './messages.js'
+import {
+  normalizeAttachmentForAPI,
+  normalizeMessagesForAPI,
+} from './messages.js'
 import { getRuntimeMainLoopModel } from './model/model.js'
+import { isFirstPartyAnthropicBaseUrl } from './model/providers.js'
 import type { SettingSource } from './settings/constants.js'
 import { jsonStringify } from './slowOperations.js'
 import { buildEffectiveSystemPrompt } from './systemPrompt.js'
 import type { Theme } from './theme.js'
-import { getCurrentUsage } from './tokens.js'
+import { getCurrentUsage, tokenCountWithEstimation } from './tokens.js'
 
 const RESERVED_CATEGORY_NAME = 'Autocompact buffer'
 const MANUAL_COMPACT_BUFFER_NAME = 'Compact buffer'
@@ -77,7 +87,12 @@ export const TOOL_TOKEN_COUNT_OVERHEAD = 500
 async function countTokensWithFallback(
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
   tools: Anthropic.Beta.Messages.BetaToolUnion[],
+  estimateOnly = false,
 ): Promise<number | null> {
+  if (estimateOnly) {
+    return roughTokenCountEstimationForAPIRequest(messages, tools)
+  }
+
   try {
     const result = await countMessagesTokensWithAPI(messages, tools)
     if (result !== null) {
@@ -236,6 +251,7 @@ export async function countToolDefinitionTokens(
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
   agentInfo: AgentDefinitionsResult | null,
   model?: string,
+  estimateOnly = false,
 ): Promise<number> {
   const toolSchemas = await Promise.all(
     tools.map(tool =>
@@ -247,7 +263,7 @@ export async function countToolDefinitionTokens(
       }),
     ),
   )
-  const result = await countTokensWithFallback([], toolSchemas)
+  const result = await countTokensWithFallback([], toolSchemas, estimateOnly)
   if (result === null || result === 0) {
     const toolNames = tools.map(t => t.name).join(', ')
     logForDebugging(
@@ -271,6 +287,7 @@ function extractSectionName(content: string): string {
 
 async function countSystemTokens(
   effectiveSystemPrompt: readonly string[],
+  estimateOnly = false,
 ): Promise<{
   systemPromptTokens: number
   systemPromptSections: SystemPromptSectionDetail[]
@@ -298,7 +315,7 @@ async function countSystemTokens(
 
   const systemTokenCounts = await Promise.all(
     namedEntries.map(({ content }) =>
-      countTokensWithFallback([{ role: 'user', content }], []),
+      countTokensWithFallback([{ role: 'user', content }], [], estimateOnly),
     ),
   )
 
@@ -317,7 +334,7 @@ async function countSystemTokens(
   return { systemPromptTokens, systemPromptSections }
 }
 
-async function countMemoryFileTokens(): Promise<{
+async function countMemoryFileTokens(estimateOnly = false): Promise<{
   memoryFileDetails: MemoryFile[]
   claudeMdTokens: number
 }> {
@@ -342,6 +359,7 @@ async function countMemoryFileTokens(): Promise<{
       const tokens = await countTokensWithFallback(
         [{ role: 'user', content: file.content }],
         [],
+        estimateOnly,
       )
 
       return { file, tokens: tokens || 0 }
@@ -366,6 +384,7 @@ async function countBuiltInToolTokens(
   agentInfo: AgentDefinitionsResult | null,
   model?: string,
   messages?: Message[],
+  estimateOnly = false,
 ): Promise<{
   builtInToolTokens: number
   deferredBuiltinDetails: DeferredBuiltinTool[]
@@ -405,6 +424,7 @@ async function countBuiltInToolTokens(
           getToolPermissionContext,
           agentInfo,
           model,
+          estimateOnly,
         )
       : 0
 
@@ -469,6 +489,7 @@ async function countBuiltInToolTokens(
           getToolPermissionContext,
           agentInfo,
           model,
+          estimateOnly,
         ),
       ),
     )
@@ -496,6 +517,7 @@ async function countBuiltInToolTokens(
       getToolPermissionContext,
       agentInfo,
       model,
+      estimateOnly,
     )
     return {
       builtInToolTokens: alwaysLoadedTokens + deferredTokens,
@@ -522,6 +544,7 @@ async function countSlashCommandTokens(
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
   agentInfo: AgentDefinitionsResult | null,
+  estimateOnly = false,
 ): Promise<{
   slashCommandTokens: number
   commandInfo: { totalCommands: number; includedCommands: number }
@@ -540,6 +563,8 @@ async function countSlashCommandTokens(
     [slashCommandTool],
     getToolPermissionContext,
     agentInfo,
+    undefined,
+    estimateOnly,
   )
 
   return {
@@ -555,6 +580,7 @@ async function countSkillTokens(
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
   agentInfo: AgentDefinitionsResult | null,
+  estimateOnly = false,
 ): Promise<{
   skillTokens: number
   skillInfo: {
@@ -582,6 +608,8 @@ async function countSkillTokens(
       [slashCommandTool],
       getToolPermissionContext,
       agentInfo,
+      undefined,
+      estimateOnly,
     )
 
     // Calculate per-skill token estimates based on frontmatter only
@@ -619,6 +647,7 @@ export async function countMcpToolTokens(
   agentInfo: AgentDefinitionsResult | null,
   model: string,
   messages?: Message[],
+  estimateOnly = false,
 ): Promise<{
   mcpToolTokens: number
   mcpToolDetails: McpTool[]
@@ -633,6 +662,7 @@ export async function countMcpToolTokens(
     getToolPermissionContext,
     agentInfo,
     model,
+    estimateOnly,
   )
   // Subtract the single overhead since we made one bulk call
   const totalTokens = Math.max(
@@ -729,9 +759,10 @@ export async function countMcpToolTokens(
   }
 }
 
-async function countCustomAgentTokens(agentDefinitions: {
-  activeAgents: AgentDefinition[]
-}): Promise<{
+async function countCustomAgentTokens(
+  agentDefinitions: { activeAgents: AgentDefinition[] },
+  estimateOnly = false,
+): Promise<{
   agentTokens: number
   agentDetails: Agent[]
 }> {
@@ -751,6 +782,7 @@ async function countCustomAgentTokens(agentDefinitions: {
           },
         ],
         [],
+        estimateOnly,
       ),
     ),
   )
@@ -785,8 +817,7 @@ function processAssistantMessage(
 ): void {
   // Process each content block individually
   for (const block of msg.message.content) {
-    const blockStr = jsonStringify(block)
-    const blockTokens = roughTokenCountEstimation(blockStr)
+    const blockTokens = roughTokenCountEstimationForContent([block])
 
     if ('type' in block && block.type === 'tool_use') {
       breakdown.toolCallTokens += blockTokens
@@ -817,8 +848,7 @@ function processUserMessage(
 
   // Process each content block individually
   for (const block of msg.message.content) {
-    const blockStr = jsonStringify(block)
-    const blockTokens = roughTokenCountEstimation(blockStr)
+    const blockTokens = roughTokenCountEstimationForContent([block])
 
     if ('type' in block && block.type === 'tool_result') {
       breakdown.toolResultTokens += blockTokens
@@ -840,8 +870,12 @@ function processAttachment(
   msg: AttachmentMessage,
   breakdown: MessageBreakdown,
 ): void {
-  const contentStr = jsonStringify(msg.attachment)
-  const tokens = roughTokenCountEstimation(contentStr)
+  const userMessages = normalizeAttachmentForAPI(msg.attachment)
+  const tokens = userMessages.reduce(
+    (total, userMsg) =>
+      total + roughTokenCountEstimationForContent(userMsg.message.content),
+    0,
+  )
   breakdown.attachmentTokens += tokens
   const attachType = msg.attachment.type || 'unknown'
   breakdown.attachmentsByType.set(
@@ -852,8 +886,12 @@ function processAttachment(
 
 async function approximateMessageTokens(
   messages: Message[],
+  estimateOnly = false,
+  alreadyMicrocompacted = false,
 ): Promise<MessageBreakdown> {
-  const microcompactResult = await microcompactMessages(messages)
+  const effectiveMessages = alreadyMicrocompacted
+    ? messages
+    : (await microcompactMessages(messages)).messages
 
   // Initialize tracking
   const breakdown: MessageBreakdown = {
@@ -870,7 +908,7 @@ async function approximateMessageTokens(
 
   // Build a map of tool_use_id to tool_name for easier lookup
   const toolUseIdToName = new Map<string, string>()
-  for (const msg of microcompactResult.messages) {
+  for (const msg of effectiveMessages) {
     if (msg.type === 'assistant') {
       for (const block of msg.message.content) {
         if ('type' in block && block.type === 'tool_use') {
@@ -886,7 +924,7 @@ async function approximateMessageTokens(
   }
 
   // Process each message for detailed breakdown
-  for (const msg of microcompactResult.messages) {
+  for (const msg of effectiveMessages) {
     if (msg.type === 'assistant') {
       processAssistantMessage(msg, breakdown)
     } else if (msg.type === 'user') {
@@ -898,7 +936,7 @@ async function approximateMessageTokens(
 
   // Calculate total tokens using the API for accuracy
   const approximateMessageTokens = await countTokensWithFallback(
-    normalizeMessagesForAPI(microcompactResult.messages).map(_ => {
+    normalizeMessagesForAPI(effectiveMessages).map(_ => {
       if (_.type === 'assistant') {
         return {
           // Important: strip out fields like id, etc. -- the counting API errors if they're present
@@ -909,6 +947,7 @@ async function approximateMessageTokens(
       return _.message
     }),
     [],
+    estimateOnly,
   )
 
   breakdown.totalTokens = approximateMessageTokens ?? 0
@@ -926,7 +965,12 @@ export async function analyzeContextUsage(
   mainThreadAgentDefinition?: AgentDefinition,
   /** Original messages before microcompact, used to extract API usage */
   originalMessages?: Message[],
+  analysisOptions?: {
+    estimateOnly?: boolean
+    messagesAlreadyMicrocompacted?: boolean
+  },
 ): Promise<ContextData> {
+  const estimateOnly = analysisOptions?.estimateOnly ?? false
   const runtimeModel = getRuntimeMainLoopModel({
     permissionMode: (await getToolPermissionContext()).mode,
     mainLoopModel: model,
@@ -961,14 +1005,15 @@ export async function analyzeContextUsage(
     { slashCommandTokens, commandInfo },
     messageBreakdown,
   ] = await Promise.all([
-    countSystemTokens(effectiveSystemPrompt),
-    countMemoryFileTokens(),
+    countSystemTokens(effectiveSystemPrompt, estimateOnly),
+    countMemoryFileTokens(estimateOnly),
     countBuiltInToolTokens(
       tools,
       getToolPermissionContext,
       agentDefinitions,
       runtimeModel,
       messages,
+      estimateOnly,
     ),
     countMcpToolTokens(
       tools,
@@ -976,10 +1021,20 @@ export async function analyzeContextUsage(
       agentDefinitions,
       runtimeModel,
       messages,
+      estimateOnly,
     ),
-    countCustomAgentTokens(agentDefinitions),
-    countSlashCommandTokens(tools, getToolPermissionContext, agentDefinitions),
-    approximateMessageTokens(messages),
+    countCustomAgentTokens(agentDefinitions, estimateOnly),
+    countSlashCommandTokens(
+      tools,
+      getToolPermissionContext,
+      agentDefinitions,
+      estimateOnly,
+    ),
+    approximateMessageTokens(
+      messages,
+      estimateOnly,
+      analysisOptions?.messagesAlreadyMicrocompacted,
+    ),
   ])
 
   // Count skills separately with error isolation
@@ -987,6 +1042,7 @@ export async function analyzeContextUsage(
     tools,
     getToolPermissionContext,
     agentDefinitions,
+    estimateOnly,
   )
   const skillInfo = skillResult.skillInfo
   // Use sum of individual skill token estimates (matches what's shown in details)
@@ -1095,8 +1151,51 @@ export async function analyzeContextUsage(
     })
   }
 
-  // Calculate actual content usage (before adding reserved buffers)
-  // Exclude deferred categories from the usage calculation
+  // Structural category estimates provide the detailed breakdown, while the
+  // canonical counter anchors the total to the latest provider usage and only
+  // estimates messages added after that response.
+  const estimatedUsage = cats.reduce(
+    (sum, cat) => sum + (cat.isDeferred ? 0 : cat.tokens),
+    0,
+  )
+
+  const usageMessages = originalMessages ?? messages
+  const apiUsage = getCurrentUsage(usageMessages)
+  const finalTotalTokens = calculateCurrentContextTokenTotal(
+    estimatedUsage,
+    apiUsage,
+    contextWindow,
+    {
+      hasMediaInput: hasMediaInput(usageMessages),
+      usageTrust: getProviderUsageTrust({
+        isFirstPartyAnthropic: isFirstPartyAnthropicBaseUrl(),
+      }),
+      canonicalTokens: apiUsage
+        ? tokenCountWithEstimation(usageMessages)
+        : undefined,
+    },
+  )
+
+  // Provider usage covers system prompt, tools, skills, and messages as one
+  // number. Reconcile the Messages category to the canonical total so the
+  // breakdown, free space, and grid cannot disagree with the headline meter.
+  const fixedUsage = cats.reduce(
+    (sum, cat) =>
+      sum + (cat.isDeferred || cat.name === 'Messages' ? 0 : cat.tokens),
+    0,
+  )
+  const reconciledMessageTokens = Math.max(0, finalTotalTokens - fixedUsage)
+  const messagesCategory = cats.find(cat => cat.name === 'Messages')
+  if (messagesCategory) {
+    messagesCategory.tokens = reconciledMessageTokens
+  } else if (reconciledMessageTokens > 0) {
+    cats.push({
+      name: 'Messages',
+      tokens: reconciledMessageTokens,
+      color: 'purple_FOR_SUBAGENTS_ONLY',
+    })
+  }
+
   const actualUsage = cats.reduce(
     (sum, cat) => sum + (cat.isDeferred ? 0 : cat.tokens),
     0,
@@ -1130,7 +1229,10 @@ export async function analyzeContextUsage(
     // doesn't need a visible reservation in the grid.
   } else if (isAutoCompact && autoCompactThreshold !== undefined) {
     // Autocompact buffer (from effective context)
-    reservedTokens = contextWindow - autoCompactThreshold
+    reservedTokens = Math.min(
+      contextWindow - autoCompactThreshold,
+      Math.max(0, contextWindow - actualUsage),
+    )
     cats.push({
       name: RESERVED_CATEGORY_NAME,
       tokens: reservedTokens,
@@ -1138,7 +1240,10 @@ export async function analyzeContextUsage(
     })
   } else if (!isAutoCompact) {
     // Compact buffer reserve (3k from actual context limit)
-    reservedTokens = MANUAL_COMPACT_BUFFER_TOKENS
+    reservedTokens = Math.min(
+      MANUAL_COMPACT_BUFFER_TOKENS,
+      Math.max(0, contextWindow - actualUsage),
+    )
     cats.push({
       name: MANUAL_COMPACT_BUFFER_NAME,
       tokens: reservedTokens,
@@ -1154,24 +1259,6 @@ export async function analyzeContextUsage(
     tokens: freeTokens,
     color: 'promptBorder',
   })
-
-  // Total for display (everything except free space)
-  const totalIncludingReserved = actualUsage
-
-  // Extract API usage from original messages (if provided) to match status line
-  // This uses the same source of truth as the status line for consistency
-  const apiUsage = getCurrentUsage(originalMessages ?? messages)
-
-  // When API usage is available, use it for total to match status line calculation
-  // Status line uses: input_tokens + cache_creation_input_tokens + cache_read_input_tokens
-  const totalFromAPI = apiUsage
-    ? apiUsage.input_tokens +
-      apiUsage.cache_creation_input_tokens +
-      apiUsage.cache_read_input_tokens
-    : null
-
-  // Use API total if available, otherwise fall back to estimated total
-  const finalTotalTokens = totalFromAPI ?? totalIncludingReserved
 
   // Pre-calculate grid based on model context window and terminal width
   // For narrow screens (< 80 cols), use 5x5 for 200k models, 5x10 for 1M+ models

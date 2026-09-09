@@ -6,7 +6,10 @@ import {
   APIUserAbortError,
 } from '@anthropic-ai/sdk'
 import type { QuerySource } from 'src/constants/querySource.js'
-import type { SystemAPIErrorMessage } from 'src/types/message.js'
+import type {
+  AssistantMessage,
+  SystemAPIErrorMessage,
+} from 'src/types/message.js'
 import { isAwsCredentialsProviderError } from 'src/utils/aws.js'
 import { logForDebugging } from 'src/utils/debug.js'
 import { logError } from 'src/utils/log.js'
@@ -35,7 +38,6 @@ import { isNonCustomOpusModel } from '../../utils/model/model.js'
 import { disableKeepAlive } from '../../utils/proxy.js'
 import { sleep } from '../../utils/sleep.js'
 import type { ThinkingConfig } from '../../utils/thinking.js'
-import { getFeatureValue_CACHED_MAY_BE_STALE } from '../analytics/growthbook.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
@@ -44,8 +46,12 @@ import {
   checkMockRateLimitError,
   isMockRateLimitError,
 } from '../rateLimitMocking.js'
-import { REPEATED_529_ERROR_MESSAGE } from './errors.js'
+import {
+  isContextOverflowErrorText,
+  REPEATED_529_ERROR_MESSAGE,
+} from './errors.js'
 import { extractConnectionErrorDetails } from './errorUtils.js'
+import { isOpenAIPolicyError } from '../openaiAuth/policyError.js'
 
 const abortError = () => new APIUserAbortError()
 
@@ -167,6 +173,134 @@ export class FallbackTriggeredError extends Error {
   }
 }
 
+/**
+ * Raised inside the streaming path when a transient, server-side error arrives
+ * mid-stream (inside the 200 SSE body) and therefore bypasses withRetry — which
+ * only wraps stream *creation*, not stream *consumption*. Caught by
+ * withStreamRetry() in claude.ts, which re-establishes the stream and retries
+ * the whole request. Carries the original SDK error so the retries-exhausted
+ * path can surface a faithful API-error message.
+ */
+export class RetriableStreamError extends Error {
+  public readonly bufferedMessages: readonly AssistantMessage[]
+
+  constructor(
+    public readonly originalError: unknown,
+    bufferedMessages: readonly AssistantMessage[] = [],
+  ) {
+    super(errorMessage(originalError))
+    this.name = 'RetriableStreamError'
+    this.bufferedMessages = bufferedMessages
+    Object.defineProperty(this, 'bufferedMessages', { enumerable: false })
+    if (originalError instanceof Error && originalError.stack) {
+      this.stack = originalError.stack
+    }
+  }
+}
+
+/**
+ * Detect transient, server-side errors that the SDK surfaces *during streaming*
+ * without a usable HTTP status. The upstream sends them inside a 200 SSE body as
+ *   {"type":"error","error":{"type":"api_error"|"overloaded_error",...}}
+ * so `error.status` is undefined and every status-based check in shouldRetry()
+ * falls through to `return false`. Per Anthropic semantics both are retryable:
+ * `api_error` = "unexpected error internal to the server", `overloaded_error` =
+ * capacity. Local/proxy providers (e.g. LM Studio) also wrap transient
+ * generation failures — such as a malformed tool_call the runtime rejects
+ * mid-stream — as `api_error`, which a fresh attempt almost always clears.
+ *
+ * Matches the serialized error body embedded in `error.message`, the same
+ * technique the overloaded-error check has always used (see shouldRetry).
+ */
+export function isRetryableStreamError(error: unknown): boolean {
+  if (isOpenAIPolicyError(error)) return false
+  if (!(error instanceof APIError)) {
+    return false
+  }
+  const message = error.message
+  if (!message) {
+    return false
+  }
+  return (
+    message.includes('"type":"api_error"') ||
+    message.includes('"type":"overloaded_error"')
+  )
+}
+
+/**
+ * Transport failures that mean the TCP/TLS connection under an *already
+ * established* stream died: a pooled keep-alive socket the peer had already
+ * closed, a proxy/NAT that dropped an idle-then-reused connection, or an
+ * upstream edge that reset the response mid-flight. Bun and Node/undici report
+ * the same physical failure under different codes.
+ */
+const STREAM_TRANSPORT_DISCONNECT_CODES = new Set([
+  'ECONNRESET',
+  'ECONNABORTED',
+  'EPIPE',
+  'UND_ERR_SOCKET',
+  'ERR_STREAM_PREMATURE_CLOSE',
+])
+
+/**
+ * Detect a transport disconnect raised while *consuming* an established stream.
+ *
+ * These reach neither retry layer on their own: withRetry only guards stream
+ * creation, and isRetryableStreamError only matches error payloads the upstream
+ * serialized into a 200 SSE body. A dead socket produces neither — under Bun it
+ * surfaces as a bare `Error` with `code: 'ECONNRESET'` and the message "The
+ * socket connection was closed unexpectedly", which is not an APIError at all.
+ * Hence the check walks the cause chain for a code instead of keying on type.
+ *
+ * Retrying is only safe behind a side-effect guard; see
+ * shouldRetryStreamAfterTransportDisconnect.
+ */
+export function isRetryableStreamTransportError(error: unknown): boolean {
+  if (isOpenAIPolicyError(error)) return false
+  const code = extractConnectionErrorDetails(error)?.code
+  return code !== undefined && STREAM_TRANSPORT_DISCONNECT_CODES.has(code)
+}
+
+/**
+ * Decide whether a mid-stream transport disconnect can be recovered by
+ * re-establishing the stream.
+ *
+ * SSE has no resume, so recovery is a full re-send — legitimate only while the
+ * failed attempt is still side-effect-free. That is exactly the boundary
+ * StreamAssistantCommitBuffer tracks: completed thinking/text stay buffered and
+ * are discarded with the attempt, but once a tool_use block completes or
+ * server-side tool activity starts, a re-send could duplicate a tool call
+ * (#766 / inc-4258), so the disconnect must surface to the user instead.
+ *
+ * A watchdog abort is excluded because it has its own retry path with a
+ * narrower safety check, and a user abort is not a fault to recover from.
+ */
+export function shouldRetryStreamAfterTransportDisconnect(input: {
+  error: unknown
+  hasCrossedSideEffectBoundary: boolean
+  streamIdleAborted: boolean
+  signalAborted: boolean
+}): boolean {
+  return (
+    !input.hasCrossedSideEffectBoundary &&
+    !input.streamIdleAborted &&
+    !input.signalAborted &&
+    isRetryableStreamTransportError(input.error)
+  )
+}
+
+/**
+ * Max times withStreamRetry() re-establishes a stream after a transient
+ * mid-stream error (see RetriableStreamError). Small by default — a malformed
+ * tool_call or a one-off blip usually clears on the first retry; this is not a
+ * capacity backoff loop. Override with CLAUDE_STREAM_TRANSIENT_RETRY_MAX;
+ * values are capped at 5 so a bad environment value cannot make it unbounded.
+ */
+export function getMaxStreamTransientRetries(): number {
+  const raw = parseInt(process.env.CLAUDE_STREAM_TRANSIENT_RETRY_MAX || '', 10)
+  return Number.isFinite(raw) && raw >= 0 ? Math.min(raw, 5) : 2
+}
+
 export async function* withRetry<T>(
   getClient: () => Promise<Anthropic>,
   operation: (
@@ -216,13 +350,7 @@ export async function* withRetry<T>(
       // - Vertex-specific auth errors (credential refresh failures, 401)
       // - ECONNRESET/EPIPE: stale keep-alive socket; disable pooling and reconnect
       const isStaleConnection = isStaleConnectionError(lastError)
-      if (
-        isStaleConnection &&
-        getFeatureValue_CACHED_MAY_BE_STALE(
-          'tengu_disable_keepalive_on_econnreset',
-          false,
-        )
-      ) {
+      if (isStaleConnection) {
         logForDebugging(
           'Stale connection (ECONNRESET/EPIPE) — disabling keep-alive for retry',
         )
@@ -252,6 +380,11 @@ export async function* withRetry<T>(
 
       return await operation(client, attempt, retryContext)
     } catch (error) {
+      // Policy rejection is final even when a gateway labels it 401/429/5xx.
+      // Stop before auth refresh, fast-mode changes or persistent/model fallback.
+      if (isOpenAIPolicyError(error)) {
+        throw new CannotRetryError(error, retryContext)
+      }
       lastError = error
       logForDebugging(
         `API error (attempt ${attempt}/${maxRetries + 1}): ${error instanceof APIError ? `${error.status} ${error.message}` : errorMessage(error)}`,
@@ -403,16 +536,13 @@ export async function* withRetry<T>(
             )
             throw error
           }
-          // Ensure we have enough tokens for thinking + at least 1 output token
-          const minRequired =
-            (retryContext.thinkingConfig.type === 'enabled'
-              ? retryContext.thinkingConfig.budgetTokens
-              : 0) + 1
-          const adjustedMaxTokens = Math.max(
-            FLOOR_OUTPUT_TOKENS,
-            availableContext,
-            minRequired,
-          )
+          const adjustedMaxTokens = availableContext
+          if (
+            retryContext.maxTokensOverride !== undefined &&
+            adjustedMaxTokens >= retryContext.maxTokensOverride
+          ) {
+            throw new CannotRetryError(error, retryContext)
+          }
           retryContext.maxTokensOverride = adjustedMaxTokens
 
           logEvent('tengu_max_tokens_context_overflow_adjustment', {
@@ -694,6 +824,7 @@ function handleGcpCredentialError(error: unknown): boolean {
 }
 
 function shouldRetry(error: APIError): boolean {
+  if (isOpenAIPolicyError(error)) return false
   // Never retry mock errors - they're from /mock-limits command for testing
   if (isMockRateLimitError(error)) {
     return false
@@ -771,6 +902,12 @@ function shouldRetry(error: APIError): boolean {
   // Clear API key cache on 401 and allow retry.
   // OAuth token handling is done in the main retry loop via handleOAuth401Error.
   if (error.status === 401) {
+    // Some gateways wrap context-overflow rejections in a 401 (#1162).
+    // Retrying just replays the same oversized prompt — fail fast so the
+    // overflow surfaces and compaction can react instead.
+    if (isContextOverflowErrorText(error.message)) {
+      return false
+    }
     clearApiKeyHelperCache()
     return true
   }

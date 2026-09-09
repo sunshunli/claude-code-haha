@@ -149,7 +149,10 @@ import {
 import { createAbortController } from 'src/utils/abortController.js'
 import { createCombinedAbortSignal } from 'src/utils/combinedAbortSignal.js'
 import { generateSessionTitle } from 'src/utils/sessionTitle.js'
-import { buildSideQuestionFallbackParams } from 'src/utils/queryContext.js'
+import {
+  buildSideQuestionFallbackParams,
+  resolveAgentMessageToolUseContext,
+} from 'src/utils/queryContext.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
   processSessionStartHooks,
@@ -187,6 +190,12 @@ import {
   type PromptVariant,
 } from 'src/services/PromptSuggestion/promptSuggestion.js'
 import { getLastCacheSafeParams } from 'src/utils/forkedAgent.js'
+import {
+  isLocalAgentTask,
+  queuePendingMessage,
+} from 'src/tasks/LocalAgentTask/LocalAgentTask.js'
+import { isMainSessionTask } from 'src/tasks/LocalMainSessionTask.js'
+import { resumeAgentBackground } from 'src/tools/AgentTool/resumeAgent.js'
 import { getAccountInformation } from 'src/utils/auth.js'
 import { OAuthService } from 'src/services/oauth/index.js'
 import { installOAuthTokens } from 'src/cli/handlers/auth.js'
@@ -239,9 +248,15 @@ import {
 } from 'src/services/mcp/elicitationHandler.js'
 import { executeNotificationHooks } from 'src/utils/hooks.js'
 import {
+  parseTaskNotificationXml,
+  shouldForwardTaskNotificationToModel,
+  TaskNotificationFollowUpBatch,
+} from 'src/utils/taskNotificationPolicy.js'
+import {
   ElicitRequestSchema,
   ElicitationCompleteNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import { disableStaleMcpReconnect } from './mcpReconnectState.js'
 import { getMcpPrefix } from 'src/services/mcp/mcpStringUtils.js'
 import {
   commandBelongsToServer,
@@ -258,7 +273,9 @@ import {
   toSDKRateLimitInfo,
 } from 'src/utils/messages/mappers.js'
 import { createModelSwitchBreadcrumbs } from 'src/utils/messages.js'
+import { PrintPartialOutputTracker } from './partialOutput.js'
 import { collectContextData } from 'src/commands/context/context-noninteractive.js'
+import { getSessionUsageSnapshot } from 'src/cost-tracker.js'
 import { LOCAL_COMMAND_STDOUT_TAG } from 'src/constants/xml.js'
 import {
   statusListeners,
@@ -272,13 +289,11 @@ import {
 } from 'src/utils/model/model.js'
 import { getModelOptions } from 'src/utils/model/modelOptions.js'
 import {
+  getSupportedEffortLevelsForModel,
   modelSupportsEffort,
-  modelSupportsMaxEffort,
-  EFFORT_LEVELS,
   resolveAppliedEffort,
 } from 'src/utils/effort.js'
 import { modelSupportsAdaptiveThinking } from 'src/utils/thinking.js'
-import { modelSupportsAutoMode } from 'src/utils/betas.js'
 import { ensureModelStringsInitialized } from 'src/utils/model/modelStrings.js'
 import {
   getSessionId,
@@ -347,7 +362,10 @@ import { unassignTeammateTasks } from '../utils/tasks.js'
 import { getRunningTasks } from '../utils/task/framework.js'
 import { isBackgroundTask } from '../tasks/types.js'
 import { stopTask } from '../tasks/stopTask.js'
-import { drainSdkEvents } from '../utils/sdkEventQueue.js'
+import {
+  drainSdkEvents,
+  setAgentRunMessageSink,
+} from '../utils/sdkEventQueue.js'
 import { initializeGrowthBook } from '../services/analytics/growthbook.js'
 import { errorMessage, toError } from '../utils/errors.js'
 import { sleep } from '../utils/sleep.js'
@@ -851,6 +869,7 @@ export async function runHeadless(
   const needsFullArray = options.outputFormat === 'json' && options.verbose
   const messages: SDKMessage[] = []
   let lastMessage: SDKMessage | undefined
+  const partialOutputTracker = new PrintPartialOutputTracker()
   // Streamlined mode transforms messages when CLAUDE_CODE_STREAMLINED_OUTPUT=true and using stream-json
   // Build flag gates this out of external builds; env var is the runtime opt-in for ant builds
   const transformToStreamlined =
@@ -875,6 +894,8 @@ export async function runHeadless(
     options,
     turnInterruptionState,
   )) {
+    partialOutputTracker.observe(message)
+
     if (transformToStreamlined) {
       // Streamlined mode: transform messages and stream immediately
       const transformed = transformToStreamlined(message)
@@ -935,9 +956,10 @@ export async function runHeadless(
       switch (lastMessage.subtype) {
         case 'success':
           writeToStdout(
-            lastMessage.result.endsWith('\n')
-              ? lastMessage.result
-              : lastMessage.result + '\n',
+            partialOutputTracker.formatResultLine(
+              lastMessage.result,
+              lastMessage.is_error,
+            ),
           )
           break
         case 'error_during_execution':
@@ -973,6 +995,13 @@ export async function runHeadless(
   )
 }
 
+export function bindAgentRunMessageSink(structuredIO: StructuredIO): () => void {
+  if (!(structuredIO instanceof RemoteIO)) return () => undefined
+  return setAgentRunMessageSink(event => {
+    structuredIO.outbound.enqueue(event)
+  })
+}
+
 function runHeadlessStreaming(
   structuredIO: StructuredIO,
   mcpClients: MCPServerConnection[],
@@ -1004,6 +1033,7 @@ function runHeadlessStreaming(
     setSDKStatus?: (status: SDKStatus) => void
     promptSuggestions?: boolean | undefined
     workload?: string | undefined
+    outputFormat: string | undefined
   },
   turnInterruptionState?: TurnInterruptionState,
 ): AsyncIterable<StdoutMessage> {
@@ -1017,9 +1047,11 @@ function runHeadlessStreaming(
   let inputClosed = false
   let shutdownPromptInjected = false
   let heldBackResult: StdoutMessage | null = null
+  const deferredAgentNotifications = new TaskNotificationFollowUpBatch()
   let abortController: AbortController | undefined
   // Same queue sendRequest() enqueues to — one FIFO for everything.
   const output = structuredIO.outbound
+  const removeAgentRunMessageSink = bindAgentRunMessageSink(structuredIO)
 
   // Ctrl+C in -p mode: abort the in-flight query, then shut down gracefully.
   // gracefulShutdown persists session state and flushes analytics, with a
@@ -1192,6 +1224,7 @@ function runHeadlessStreaming(
   }
 
   const modelOptions = getModelOptions()
+  const autoModeSupported = feature('TRANSCRIPT_CLASSIFIER') ? true : false
   const modelInfos = modelOptions.map(option => {
     const modelId = option.value === null ? 'default' : option.value
     const resolvedModel =
@@ -1201,16 +1234,15 @@ function runHeadlessStreaming(
     const hasEffort = modelSupportsEffort(resolvedModel)
     const hasAdaptiveThinking = modelSupportsAdaptiveThinking(resolvedModel)
     const hasFastMode = isFastModeSupportedByModel(option.value)
-    const hasAutoMode = modelSupportsAutoMode(resolvedModel)
+    const hasAutoMode = autoModeSupported
     return {
       value: modelId,
       displayName: option.label,
       description: option.description,
       ...(hasEffort && {
         supportsEffort: true,
-        supportedEffortLevels: modelSupportsMaxEffort(resolvedModel)
-          ? [...EFFORT_LEVELS]
-          : EFFORT_LEVELS.filter(l => l !== 'max'),
+        supportedEffortLevels:
+          getSupportedEffortLevelsForModel(resolvedModel),
       }),
       ...(hasAdaptiveThinking && { supportsAdaptiveThinking: true }),
       ...(hasFastMode && { supportsFastMode: true }),
@@ -2007,58 +2039,14 @@ function runHeadlessStreaming(
             notifyCommandLifecycle(uuid, 'started')
           }
 
-          // Task notifications arrive when background agents complete.
-          // Emit an SDK system event for SDK consumers, then fall through
-          // to ask() so the model sees the agent result and can act on it.
-          // This matches TUI behavior where useQueueProcessor always feeds
-          // notifications to the model regardless of coordinator mode.
+          // Task notifications arrive when background tasks complete.
+          // Emit SDK system events for structured consumers, then only feed
+          // notifications back to the model for task types that still need a
+          // model follow-up (for example background shell commands).
           if (command.mode === 'task-notification') {
             const notificationText =
               typeof command.value === 'string' ? command.value : ''
-            // Parse the XML-formatted notification
-            const taskIdMatch = notificationText.match(
-              /<task-id>([^<]+)<\/task-id>/,
-            )
-            const toolUseIdMatch = notificationText.match(
-              /<tool-use-id>([^<]+)<\/tool-use-id>/,
-            )
-            const outputFileMatch = notificationText.match(
-              /<output-file>([^<]+)<\/output-file>/,
-            )
-            const statusMatch = notificationText.match(
-              /<status>([^<]+)<\/status>/,
-            )
-            const summaryMatch = notificationText.match(
-              /<summary>([^<]+)<\/summary>/,
-            )
-
-            const isValidStatus = (
-              s: string | undefined,
-            ): s is 'completed' | 'failed' | 'stopped' | 'killed' =>
-              s === 'completed' ||
-              s === 'failed' ||
-              s === 'stopped' ||
-              s === 'killed'
-            const rawStatus = statusMatch?.[1]
-            const status = isValidStatus(rawStatus)
-              ? rawStatus === 'killed'
-                ? 'stopped'
-                : rawStatus
-              : 'completed'
-
-            const usageMatch = notificationText.match(
-              /<usage>([\s\S]*?)<\/usage>/,
-            )
-            const usageContent = usageMatch?.[1] ?? ''
-            const totalTokensMatch = usageContent.match(
-              /<total_tokens>(\d+)<\/total_tokens>/,
-            )
-            const toolUsesMatch = usageContent.match(
-              /<tool_uses>(\d+)<\/tool_uses>/,
-            )
-            const durationMsMatch = usageContent.match(
-              /<duration_ms>(\d+)<\/duration_ms>/,
-            )
+            const notification = parseTaskNotificationXml(notificationText)
 
             // Only emit a task_notification SDK event when a <status> tag is
             // present — that means this is a terminal notification (completed/
@@ -2067,30 +2055,33 @@ function runHeadlessStreaming(
             // default to 'completed' and falsely close the task for SDK
             // consumers. Terminal bookends are now emitted directly via
             // emitTaskTerminatedSdk, so skipping statusless events is safe.
-            if (statusMatch) {
+            if (notification.status) {
               output.enqueue({
                 type: 'system',
                 subtype: 'task_notification',
-                task_id: taskIdMatch?.[1] ?? '',
-                tool_use_id: toolUseIdMatch?.[1],
-                status,
-                output_file: outputFileMatch?.[1] ?? '',
-                summary: summaryMatch?.[1] ?? '',
-                usage:
-                  totalTokensMatch && toolUsesMatch
-                    ? {
-                        total_tokens: parseInt(totalTokensMatch[1]!, 10),
-                        tool_uses: parseInt(toolUsesMatch[1]!, 10),
-                        duration_ms: durationMsMatch
-                          ? parseInt(durationMsMatch[1]!, 10)
-                          : 0,
-                      }
-                    : undefined,
+                task_id: notification.taskId,
+                tool_use_id: notification.toolUseId,
+                status: notification.status,
+                output_file: notification.outputFile,
+                summary: notification.summary,
+                result: notification.result,
+                workflow_run_id: notification.workflowRunId,
+                usage: notification.usage,
                 session_id: getSessionId(),
                 uuid: randomUUID(),
               })
             }
-            // No continue -- fall through to ask() so the model processes the result
+            if (
+              !shouldForwardTaskNotificationToModel(notification, {
+                structuredOutput: options.outputFormat === 'stream-json',
+              })
+            ) {
+              deferredAgentNotifications.defer(notificationText)
+              for (const uuid of batchUuids) {
+                notifyCommandLifecycle(uuid, 'completed')
+              }
+              continue
+            }
           }
 
           const input = command.value
@@ -2393,9 +2384,13 @@ function runHeadlessStreaming(
             t => isBackgroundTask(t) && t.type !== 'in_process_teammate',
           )
           const hasMainThreadQueued = peek(isMainThread) !== undefined
-          if (hasRunningBg || hasMainThreadQueued) {
+          const agentFollowUp = deferredAgentNotifications.takeIfSettled(hasRunningBg || hasMainThreadQueued)
+          if (agentFollowUp) {
+            enqueue({ mode: 'prompt', value: agentFollowUp, priority: 'later', isMeta: true })
+          }
+          if (hasRunningBg || hasMainThreadQueued || agentFollowUp) {
             waitingForAgents = true
-            if (!hasMainThreadQueued) {
+            if (!hasMainThreadQueued && !agentFollowUp) {
               runPhase = 'waiting_for_agents'
               // No commands ready yet, wait for tasks to complete
               await sleep(100)
@@ -2675,6 +2670,7 @@ function runHeadlessStreaming(
         unsubscribeSkillChanges()
         unsubscribeAuthStatus?.()
         statusListeners.delete(rateLimitListener)
+        removeAgentRunMessageSink()
         output.done()
       }
     }
@@ -2958,6 +2954,8 @@ function runHeadlessStreaming(
           sendControlResponseSuccess(message, {
             mcpServers: buildMcpServerStatuses(),
           })
+        } else if (message.request.subtype === 'get_session_usage') {
+          sendControlResponseSuccess(message, getSessionUsageSnapshot())
         } else if (message.request.subtype === 'get_context_usage') {
           try {
             const appState = getAppState()
@@ -2970,6 +2968,7 @@ function runHeadlessStreaming(
                 agentDefinitions: appState.agentDefinitions,
                 customSystemPrompt: options.systemPrompt,
                 appendSystemPrompt: options.appendSystemPrompt,
+                estimateOnly: Boolean(message.request.estimateOnly),
               },
             })
             sendControlResponseSuccess(message, { ...data })
@@ -3151,56 +3150,103 @@ function runHeadlessStreaming(
             sendControlResponseError(message, `Server not found: ${serverName}`)
           } else {
             const result = await reconnectMcpServerImpl(serverName, config)
-            // Update appState.mcp with the new client, tools, commands, and resources
-            const prefix = getMcpPrefix(serverName)
-            setAppState(prev => ({
-              ...prev,
-              mcp: {
-                ...prev.mcp,
-                clients: prev.mcp.clients.map(c =>
-                  c.name === serverName ? result.client : c,
-                ),
-                tools: [
-                  ...reject(prev.mcp.tools, t => t.name?.startsWith(prefix)),
-                  ...result.tools,
-                ],
-                commands: [
-                  ...reject(prev.mcp.commands, c =>
+            // If the server was disabled while the reconnect was in flight,
+            // close any fresh connection and keep the disabled state
+            if (isMcpServerDisabled(serverName)) {
+              if (result.client.type === 'connected') {
+                void result.client.cleanup()
+              }
+              const prefix = getMcpPrefix(serverName)
+              setAppState(prev => ({
+                ...prev,
+                mcp: {
+                  ...prev.mcp,
+                  clients: prev.mcp.clients.map(c =>
+                    c.name === serverName
+                      ? { name: serverName, type: 'disabled' as const, config }
+                      : c,
+                  ),
+                  tools: reject(prev.mcp.tools, t =>
+                    t.name?.startsWith(prefix),
+                  ),
+                  commands: reject(prev.mcp.commands, c =>
                     commandBelongsToServer(c, serverName),
                   ),
-                  ...result.commands,
+                  resources: omit(prev.mcp.resources, serverName),
+                },
+              }))
+              dynamicMcpState = {
+                ...dynamicMcpState,
+                clients: [
+                  ...dynamicMcpState.clients.filter(
+                    c => c.name !== serverName,
+                  ),
+                  { name: serverName, type: 'disabled' as const, config },
                 ],
-                resources:
-                  result.resources && result.resources.length > 0
-                    ? { ...prev.mcp.resources, [serverName]: result.resources }
-                    : omit(prev.mcp.resources, serverName),
-              },
-            }))
-            // Also update dynamicMcpState so run() picks up the new tools
-            // on the next turn (run() reads dynamicMcpState, not appState)
-            dynamicMcpState = {
-              ...dynamicMcpState,
-              clients: [
-                ...dynamicMcpState.clients.filter(c => c.name !== serverName),
-                result.client,
-              ],
-              tools: [
-                ...dynamicMcpState.tools.filter(
+                tools: dynamicMcpState.tools.filter(
                   t => !t.name?.startsWith(prefix),
                 ),
-                ...result.tools,
-              ],
-            }
-            if (result.client.type === 'connected') {
-              registerElicitationHandlers([result.client])
-              reregisterChannelHandlerAfterReconnect(result.client)
+              }
               sendControlResponseSuccess(message)
             } else {
-              const errorMessage =
-                result.client.type === 'failed'
-                  ? (result.client.error ?? 'Connection failed')
-                  : `Server status: ${result.client.type}`
-              sendControlResponseError(message, errorMessage)
+              // Update appState.mcp with the new client, tools, commands, and resources
+              const prefix = getMcpPrefix(serverName)
+              setAppState(prev => ({
+                ...prev,
+                mcp: {
+                  ...prev.mcp,
+                  clients: prev.mcp.clients.map(c =>
+                    c.name === serverName ? result.client : c,
+                  ),
+                  tools: [
+                    ...reject(prev.mcp.tools, t =>
+                      t.name?.startsWith(prefix),
+                    ),
+                    ...result.tools,
+                  ],
+                  commands: [
+                    ...reject(prev.mcp.commands, c =>
+                      commandBelongsToServer(c, serverName),
+                    ),
+                    ...result.commands,
+                  ],
+                  resources:
+                    result.resources && result.resources.length > 0
+                      ? {
+                          ...prev.mcp.resources,
+                          [serverName]: result.resources,
+                        }
+                      : omit(prev.mcp.resources, serverName),
+                },
+              }))
+              // Also update dynamicMcpState so run() picks up the new tools
+              // on the next turn (run() reads dynamicMcpState, not appState)
+              dynamicMcpState = {
+                ...dynamicMcpState,
+                clients: [
+                  ...dynamicMcpState.clients.filter(
+                    c => c.name !== serverName,
+                  ),
+                  result.client,
+                ],
+                tools: [
+                  ...dynamicMcpState.tools.filter(
+                    t => !t.name?.startsWith(prefix),
+                  ),
+                  ...result.tools,
+                ],
+              }
+              if (result.client.type === 'connected') {
+                registerElicitationHandlers([result.client])
+                reregisterChannelHandlerAfterReconnect(result.client)
+                sendControlResponseSuccess(message)
+              } else {
+                const errorMessage =
+                  result.client.type === 'failed'
+                    ? (result.client.error ?? 'Connection failed')
+                    : `Server status: ${result.client.type}`
+                sendControlResponseError(message, errorMessage)
+              }
             }
           }
         } else if (message.request.subtype === 'mcp_toggle') {
@@ -3219,6 +3265,26 @@ function runHeadlessStreaming(
               ?.config ??
             null
 
+          const markDisabled = (cfg: NonNullable<typeof config>) => {
+            const prefix = getMcpPrefix(serverName)
+            setAppState(prev => ({
+              ...prev,
+              mcp: {
+                ...prev.mcp,
+                clients: prev.mcp.clients.map(c =>
+                  c.name === serverName
+                    ? { name: serverName, type: 'disabled' as const, config: cfg }
+                    : c,
+                ),
+                tools: reject(prev.mcp.tools, t => t.name?.startsWith(prefix)),
+                commands: reject(prev.mcp.commands, c =>
+                  commandBelongsToServer(c, serverName),
+                ),
+                resources: omit(prev.mcp.resources, serverName),
+              },
+            }))
+          }
+
           if (!config) {
             sendControlResponseError(message, `Server not found: ${serverName}`)
           } else if (!enabled) {
@@ -3230,68 +3296,66 @@ function runHeadlessStreaming(
               ...dynamicMcpState.clients,
               ...currentAppState.mcp.clients,
             ].find(c => c.name === serverName)
+            markDisabled(config)
             if (client && client.type === 'connected') {
               await clearServerCache(serverName, config)
             }
-            // Update appState.mcp to reflect disabled status and remove tools/commands/resources
-            const prefix = getMcpPrefix(serverName)
-            setAppState(prev => ({
-              ...prev,
-              mcp: {
-                ...prev.mcp,
-                clients: prev.mcp.clients.map(c =>
-                  c.name === serverName
-                    ? { name: serverName, type: 'disabled' as const, config }
-                    : c,
-                ),
-                tools: reject(prev.mcp.tools, t => t.name?.startsWith(prefix)),
-                commands: reject(prev.mcp.commands, c =>
-                  commandBelongsToServer(c, serverName),
-                ),
-                resources: omit(prev.mcp.resources, serverName),
-              },
-            }))
             sendControlResponseSuccess(message)
           } else {
             // Enabling: persist + reconnect
             setMcpServerEnabled(serverName, true)
             const result = await reconnectMcpServerImpl(serverName, config)
-            // Update appState.mcp with the new client, tools, commands, and resources
-            // This ensures the LLM sees updated tools after enabling the server
-            const prefix = getMcpPrefix(serverName)
-            setAppState(prev => ({
-              ...prev,
-              mcp: {
-                ...prev.mcp,
-                clients: prev.mcp.clients.map(c =>
-                  c.name === serverName ? result.client : c,
-                ),
-                tools: [
-                  ...reject(prev.mcp.tools, t => t.name?.startsWith(prefix)),
-                  ...result.tools,
-                ],
-                commands: [
-                  ...reject(prev.mcp.commands, c =>
-                    commandBelongsToServer(c, serverName),
-                  ),
-                  ...result.commands,
-                ],
-                resources:
-                  result.resources && result.resources.length > 0
-                    ? { ...prev.mcp.resources, [serverName]: result.resources }
-                    : omit(prev.mcp.resources, serverName),
-              },
-            }))
-            if (result.client.type === 'connected') {
-              registerElicitationHandlers([result.client])
-              reregisterChannelHandlerAfterReconnect(result.client)
+            // If the server was disabled while the reconnect was in flight,
+            // close any fresh connection and keep the disabled state
+            if (isMcpServerDisabled(serverName)) {
+              if (result.client.type === 'connected') {
+                void result.client.cleanup()
+              }
+              markDisabled(config)
               sendControlResponseSuccess(message)
             } else {
-              const errorMessage =
-                result.client.type === 'failed'
-                  ? (result.client.error ?? 'Connection failed')
-                  : `Server status: ${result.client.type}`
-              sendControlResponseError(message, errorMessage)
+              // Update appState.mcp with the new client, tools, commands, and resources
+              // This ensures the LLM sees updated tools after enabling the server
+              const prefix = getMcpPrefix(serverName)
+              setAppState(prev => ({
+                ...prev,
+                mcp: {
+                  ...prev.mcp,
+                  clients: prev.mcp.clients.map(c =>
+                    c.name === serverName ? result.client : c,
+                  ),
+                  tools: [
+                    ...reject(prev.mcp.tools, t =>
+                      t.name?.startsWith(prefix),
+                    ),
+                    ...result.tools,
+                  ],
+                  commands: [
+                    ...reject(prev.mcp.commands, c =>
+                      commandBelongsToServer(c, serverName),
+                    ),
+                    ...result.commands,
+                  ],
+                  resources:
+                    result.resources && result.resources.length > 0
+                      ? {
+                          ...prev.mcp.resources,
+                          [serverName]: result.resources,
+                        }
+                      : omit(prev.mcp.resources, serverName),
+                },
+              }))
+              if (result.client.type === 'connected') {
+                registerElicitationHandlers([result.client])
+                reregisterChannelHandlerAfterReconnect(result.client)
+                sendControlResponseSuccess(message)
+              } else {
+                const errorMessage =
+                  result.client.type === 'failed'
+                    ? (result.client.error ?? 'Connection failed')
+                    : `Server status: ${result.client.type}`
+                sendControlResponseError(message, errorMessage)
+              }
             }
           }
         } else if (message.request.subtype === 'channel_enable') {
@@ -3393,6 +3457,23 @@ function runHeadlessStreaming(
                     serverName,
                     config,
                   )
+                  // If the server was disabled while the reconnect was in
+                  // flight, close any fresh connection and keep the disabled
+                  // state
+                  if (isMcpServerDisabled(serverName)) {
+                    setAppState(prev => {
+                      const disabled = disableStaleMcpReconnect(
+                        serverName,
+                        config,
+                        result.client,
+                        prev.mcp,
+                        dynamicMcpState,
+                      )
+                      dynamicMcpState = disabled.dynamic
+                      return { ...prev, mcp: disabled.mcp }
+                    })
+                    return
+                  }
                   const prefix = getMcpPrefix(serverName)
                   setAppState(prev => ({
                     ...prev,
@@ -3780,6 +3861,62 @@ function runHeadlessStreaming(
           } catch (error) {
             sendControlResponseError(message, errorMessage(error))
           }
+        } else if (message.request.subtype === 'send_agent_message') {
+          const agentId = message.request.agent_id.trim()
+          const content = message.request.content.trim()
+          if (!agentId || !content) {
+            sendControlResponseError(message, 'Agent id and message content are required')
+            continue
+          }
+
+          try {
+            const task = getAppState().tasks[agentId]
+            if (
+              task?.status === 'running' &&
+              isLocalAgentTask(task) &&
+              !isMainSessionTask(task)
+            ) {
+              queuePendingMessage(agentId, content, setAppState)
+              sendControlResponseSuccess(message, {
+                agent_id: agentId,
+                delivery: 'queued',
+              })
+              continue
+            }
+
+            const toolUseContext = await resolveAgentMessageToolUseContext(
+              getLastCacheSafeParams(),
+              () => buildSideQuestionFallbackParams({
+                tools: buildAllTools(getAppState()),
+                commands: currentCommands,
+                mcpClients: [
+                  ...getAppState().mcp.clients,
+                  ...sdkClients,
+                  ...dynamicMcpState.clients,
+                ],
+                messages: mutableMessages,
+                readFileState,
+                getAppState,
+                setAppState,
+                customSystemPrompt: options.systemPrompt,
+                appendSystemPrompt: options.appendSystemPrompt,
+                thinkingConfig: options.thinkingConfig,
+                agents: currentAgents,
+              }),
+            )
+            await resumeAgentBackground({
+              agentId,
+              prompt: content,
+              toolUseContext,
+              canUseTool,
+            })
+            sendControlResponseSuccess(message, {
+              agent_id: agentId,
+              delivery: 'resumed',
+            })
+          } catch (error) {
+            sendControlResponseError(message, errorMessage(error))
+          }
         } else if (message.request.subtype === 'generate_session_title') {
           // Fire-and-forget so the Haiku call does not block the stdin loop
           // (which would delay processing of subsequent user messages /
@@ -4135,12 +4272,15 @@ function runHeadlessStreaming(
       unsubscribeSkillChanges()
       unsubscribeAuthStatus?.()
       statusListeners.delete(rateLimitListener)
+      removeAgentRunMessageSink()
       output.done()
     }
   })()
 
   return output
 }
+
+export { runHeadlessStreaming as __runHeadlessStreamingForTests }
 
 /**
  * Creates a CanUseToolFn that incorporates a custom permission prompt tool.

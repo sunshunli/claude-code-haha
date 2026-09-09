@@ -121,6 +121,27 @@ export const SDKControlPermissionRequestSchema = lazySchema(() =>
     .describe('Requests permission to use a tool with the given input.'),
 )
 
+/**
+ * Hands the CLI process the token that authenticates Computer Use approval
+ * callbacks from the desktop shell.
+ *
+ * The length is pinned rather than left open: the token is a 256-bit value
+ * rendered as lowercase hex, and accepting anything shorter would let a
+ * truncated or placeholder value install itself as a working credential.
+ */
+export const SDKControlSetComputerUseApprovalTokenRequestSchema = lazySchema(() =>
+  z
+    .object({
+      subtype: z.literal('set_computer_use_approval_token'),
+      token: z
+        .string()
+        .regex(/^[a-f0-9]{64}$/, 'must be 64 lowercase hex characters'),
+    })
+    .describe(
+      'Installs the desktop-issued token that authenticates Computer Use approval requests.',
+    ),
+)
+
 export const SDKControlSetPermissionModeRequestSchema = lazySchema(() =>
   z
     .object({
@@ -176,10 +197,53 @@ export const SDKControlGetContextUsageRequestSchema = lazySchema(() =>
   z
     .object({
       subtype: z.literal('get_context_usage'),
+      estimateOnly: z.boolean().optional(),
     })
     .describe(
       'Requests a breakdown of current context window usage by category.',
     ),
+)
+
+export const SDKControlGetSessionUsageRequestSchema = lazySchema(() =>
+  z
+    .object({
+      subtype: z.literal('get_session_usage'),
+    })
+    .describe('Requests accumulated cost and token usage for the current session.'),
+)
+
+export const SDKControlGetSessionUsageResponseSchema = lazySchema(() =>
+  z
+    .object({
+      totalCostUSD: z.number(),
+      costDisplay: z.string(),
+      hasUnknownModelCost: z.boolean(),
+      totalAPIDuration: z.number(),
+      totalDuration: z.number(),
+      totalLinesAdded: z.number(),
+      totalLinesRemoved: z.number(),
+      totalInputTokens: z.number(),
+      totalOutputTokens: z.number(),
+      totalCacheReadInputTokens: z.number(),
+      totalCacheCreationInputTokens: z.number(),
+      totalWebSearchRequests: z.number(),
+      models: z.array(
+        z.object({
+          model: z.string(),
+          displayName: z.string(),
+          inputTokens: z.number(),
+          outputTokens: z.number(),
+          cacheReadInputTokens: z.number(),
+          cacheCreationInputTokens: z.number(),
+          webSearchRequests: z.number(),
+          costUSD: z.number(),
+          costDisplay: z.string(),
+          contextWindow: z.number(),
+          maxOutputTokens: z.number(),
+        }),
+      ),
+    })
+    .describe('Accumulated cost, duration, code change, and model usage data.'),
 )
 
 const ContextCategorySchema = lazySchema(() =>
@@ -461,6 +525,16 @@ export const SDKControlStopTaskRequestSchema = lazySchema(() =>
     .describe('Stops a running task.'),
 )
 
+export const SDKControlSendAgentMessageRequestSchema = lazySchema(() =>
+  z
+    .object({
+      subtype: z.literal('send_agent_message'),
+      agent_id: z.string().min(1),
+      content: z.string().min(1),
+    })
+    .describe('Queues a follow-up message for an existing subagent, resuming it when necessary.'),
+)
+
 export const SDKControlApplyFlagSettingsRequestSchema = lazySchema(() =>
   z
     .object({
@@ -507,7 +581,7 @@ export const SDKControlGetSettingsResponseSchema = lazySchema(() =>
           model: z.string(),
           // String levels only — numeric effort is ant-only and the
           // Zod→proto generator can't emit enum∪number unions.
-          effort: z.enum(['low', 'medium', 'high', 'max']).nullable(),
+          effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable(),
         })
         .optional()
         .describe(
@@ -555,10 +629,12 @@ export const SDKControlRequestInnerSchema = lazySchema(() =>
     SDKControlPermissionRequestSchema(),
     SDKControlInitializeRequestSchema(),
     SDKControlSetPermissionModeRequestSchema(),
+    SDKControlSetComputerUseApprovalTokenRequestSchema(),
     SDKControlSetModelRequestSchema(),
     SDKControlSetMaxThinkingTokensRequestSchema(),
     SDKControlMcpStatusRequestSchema(),
     SDKControlGetContextUsageRequestSchema(),
+    SDKControlGetSessionUsageRequestSchema(),
     SDKHookCallbackRequestSchema(),
     SDKControlMcpMessageRequestSchema(),
     SDKControlRewindFilesRequestSchema(),
@@ -569,6 +645,7 @@ export const SDKControlRequestInnerSchema = lazySchema(() =>
     SDKControlMcpReconnectRequestSchema(),
     SDKControlMcpToggleRequestSchema(),
     SDKControlStopTaskRequestSchema(),
+    SDKControlSendAgentMessageRequestSchema(),
     SDKControlApplyFlagSettingsRequestSchema(),
     SDKControlGetSettingsRequestSchema(),
     SDKControlElicitationRequestSchema(),

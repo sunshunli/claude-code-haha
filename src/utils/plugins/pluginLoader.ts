@@ -84,7 +84,10 @@ import type { HooksSettings } from '../settings/types.js'
 import { SettingsSchema } from '../settings/types.js'
 import { jsonParse, jsonStringify } from '../slowOperations.js'
 import { getAddDirEnabledPlugins } from './addDirPluginSettings.js'
-import { verifyAndDemote } from './dependencyResolver.js'
+import {
+  isEnabledPluginSettingValue,
+  verifyAndDemote,
+} from './dependencyResolver.js'
 import { classifyFetchError, logPluginFetch } from './fetchTelemetry.js'
 import { checkGitAvailable } from './gitAvailability.js'
 import { getInMemoryInstalledPlugins } from './installedPluginsManager.js'
@@ -1588,6 +1591,31 @@ export async function createPluginFromPath(
     plugin.outputStylesPath = outputStylesPath
   }
 
+  // Step 4c-2: Register dynamic workflows shipped by the plugin. Namespaced by
+  // plugin name at command-build time, so two plugins can both ship `review`.
+  const workflowsPath = join(pluginPath, 'workflows')
+  if (await pathExists(workflowsPath)) {
+    plugin.workflowsPath = workflowsPath
+  }
+  if (manifest.workflows) {
+    const declared = Array.isArray(manifest.workflows)
+      ? manifest.workflows
+      : [manifest.workflows]
+    const validPaths = await validatePluginPaths(
+      declared,
+      pluginPath,
+      manifest.name,
+      source,
+      'workflows',
+      'Workflow',
+      'specified in manifest but',
+      errors,
+    )
+    if (validPaths.length > 0) {
+      plugin.workflowsPaths = validPaths
+    }
+  }
+
   // Step 4e: Process additional output style paths from manifest
   if (manifest.outputStyles) {
     const outputStylePaths = Array.isArray(manifest.outputStyles)
@@ -2049,12 +2077,13 @@ async function loadPluginsFromMarketplaces({
       // (version for the full loader's first-pass probe, installPath for
       // the cache-only loader's direct read).
       const installEntry = installedPluginsData.plugins[pluginId]?.[0]
+      const enabled = isEnabledPluginSettingValue(enabledValue)
       return cacheOnly
         ? loadPluginFromMarketplaceEntryCacheOnly(
             result.entry,
             result.marketplaceInstallLocation,
             pluginId,
-            enabledValue === true,
+            enabled,
             errors,
             installEntry?.installPath,
           )
@@ -2062,7 +2091,7 @@ async function loadPluginsFromMarketplaces({
             result.entry,
             result.marketplaceInstallLocation,
             pluginId,
-            enabledValue === true,
+            enabled,
             errors,
             installEntry?.version,
           )

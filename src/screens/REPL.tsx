@@ -568,6 +568,8 @@ export type Props = {
   sshSession?: SSHSession;
   // Thinking configuration to use when thinking is enabled
   thinkingConfig: ThinkingConfig;
+  // When true, an explicit CLI --effort is authoritative over session env.
+  effortValueOverridesEnv?: boolean;
 };
 export type Screen = 'prompt' | 'transcript';
 export function REPL({
@@ -595,7 +597,8 @@ export function REPL({
   remoteSessionConfig,
   directConnectConfig,
   sshSession,
-  thinkingConfig
+  thinkingConfig,
+  effortValueOverridesEnv
 }: Props): React.ReactNode {
   const isRemoteSession = !!remoteSessionConfig;
 
@@ -2045,7 +2048,7 @@ export function REPL({
     // Undercover auto-enable explainer (ant-only, eliminated from external builds)
     if ("external" === 'ant' && allowDialogsWithAnimation && showUndercoverCallout) return 'undercover-callout';
 
-    // Effort callout (shown once for Opus 4.6 users when effort is enabled)
+    // Effort callout (shown once for Opus 4.7 users when effort is enabled)
     if (allowDialogsWithAnimation && showEffortCallout) return 'effort-callout';
 
     // Remote callout (shown once before first bridge enable)
@@ -2415,7 +2418,9 @@ export function REPL({
         debug,
         verbose: s.verbose,
         mainLoopModel,
-        thinkingConfig: s.thinkingEnabled !== false ? thinkingConfig : {
+        thinkingConfig: s.thinkingEnabled !== false ? (
+          thinkingConfig.type === 'disabled' ? { type: 'adaptive' } : thinkingConfig
+        ) : {
           type: 'disabled'
         },
         // Merge fresh from store rather than closing over useMergedClients'
@@ -2432,6 +2437,7 @@ export function REPL({
         } : s.agentDefinitions,
         customSystemPrompt,
         appendSystemPrompt,
+        effortValueOverridesEnv,
         refreshTools: computeTools
       },
       getAppState: () => store.getState(),

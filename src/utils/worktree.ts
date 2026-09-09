@@ -3,15 +3,26 @@ import chalk from 'chalk'
 import { spawnSync } from 'child_process'
 import {
   copyFile,
+  lstat,
   mkdir,
   readdir,
   readFile,
+  realpath,
   stat,
   symlink,
   utimes,
+  writeFile,
 } from 'fs/promises'
 import ignore from 'ignore'
-import { basename, dirname, join } from 'path'
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from 'path'
 import { saveCurrentProjectConfig } from './config.js'
 import { getCwd } from './cwd.js'
 import { logForDebugging } from './debug.js'
@@ -205,6 +216,126 @@ function worktreesDir(repoRoot: string): string {
   return join(repoRoot, '.claude', 'worktrees')
 }
 
+function isPathContainedBy(parentPath: string, candidatePath: string): boolean {
+  const relativePath = relative(parentPath, candidatePath)
+  return (
+    relativePath === '' ||
+    (!isAbsolute(relativePath) &&
+      relativePath !== '..' &&
+      !relativePath.startsWith(`..${sep}`))
+  )
+}
+
+/**
+ * Refuse managed worktree paths whose on-disk resolution cannot be proven to
+ * stay inside the repository. In particular, lstat is intentional here:
+ * stat/realpath alone would silently follow a committed symlink or Windows
+ * junction at .claude or .claude/worktrees.
+ */
+async function assertSafeWorktreeLocation(
+  repoRoot: string,
+  worktreePath?: string,
+): Promise<void> {
+  const resolvedRepoRoot = resolve(repoRoot)
+  const resolvedWorktreesDir = resolve(worktreesDir(repoRoot))
+  const resolvedWorktreePath = worktreePath
+    ? resolve(worktreePath)
+    : undefined
+  const displayPath = resolvedWorktreePath ?? resolvedWorktreesDir
+  const refuse = (reason: string): never => {
+    throw new Error(
+      `Refusing to use unsafe worktree path "${displayPath}": ${reason}`,
+    )
+  }
+
+  if (!isPathContainedBy(resolvedRepoRoot, resolvedWorktreesDir)) {
+    refuse('the worktrees directory is outside the repository')
+  }
+  if (
+    resolvedWorktreePath &&
+    dirname(resolvedWorktreePath) !== resolvedWorktreesDir
+  ) {
+    refuse('the worktree is not a direct child of .claude/worktrees')
+  }
+
+  const managedPaths = [
+    join(resolvedRepoRoot, '.claude'),
+    resolvedWorktreesDir,
+  ]
+  if (resolvedWorktreePath) {
+    managedPaths.push(resolvedWorktreePath)
+  }
+
+  for (const managedPath of managedPaths) {
+    const metadata = await lstat(managedPath).catch(error => {
+      if (getErrnoCode(error) === 'ENOENT') return null
+      return refuse(`cannot inspect ${managedPath}: ${errorMessage(error)}`)
+    })
+    if (!metadata) continue
+    if (metadata.isSymbolicLink()) {
+      refuse(`${managedPath} is a symbolic link or junction`)
+    }
+  }
+
+  let canonicalRepoRoot: string
+  try {
+    canonicalRepoRoot = await realpath(resolvedRepoRoot)
+  } catch (error) {
+    refuse(`cannot resolve the repository root: ${errorMessage(error)}`)
+  }
+
+  let existingAncestor = displayPath
+  while (true) {
+    let canonicalAncestor: string
+    try {
+      canonicalAncestor = await realpath(existingAncestor)
+    } catch (error) {
+      if (getErrnoCode(error) !== 'ENOENT') {
+        refuse(`cannot resolve ${existingAncestor}: ${errorMessage(error)}`)
+      }
+      const parent = dirname(existingAncestor)
+      if (parent === existingAncestor) {
+        refuse('no existing ancestor can be verified')
+      }
+      existingAncestor = parent
+      continue
+    }
+    if (!isPathContainedBy(canonicalRepoRoot, canonicalAncestor)) {
+      refuse('its canonical path escapes the repository')
+    }
+    break
+  }
+}
+
+export async function ensureWorktreesDirExcluded(repoRoot: string): Promise<void> {
+  const gitDir = await resolveGitDir(repoRoot)
+  const commonDir = gitDir ? ((await getCommonDir(gitDir)) ?? gitDir) : null
+  if (!commonDir) return
+
+  const excludePath = join(commonDir, 'info', 'exclude')
+  const pattern = '.claude/worktrees/'
+  let existing = ''
+  try {
+    existing = await readFile(excludePath, 'utf-8')
+  } catch {
+    // Missing exclude file is normal in freshly initialized repositories.
+  }
+
+  const alreadyExcluded = existing
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .some(line => line === pattern || line === `/${pattern}`)
+  if (alreadyExcluded) return
+
+  await mkdir(dirname(excludePath), { recursive: true })
+  const prefix = existing.length === 0 || existing.endsWith('\n') ? existing : `${existing}\n`
+  await writeFile(
+    excludePath,
+    `${prefix}# Claude worktree sessions\n${pattern}\n`,
+    'utf-8',
+  )
+}
+
 // Flatten nested slugs (`user/feature` → `user+feature`) for both the branch
 // name and the directory path. Nesting in either location is unsafe:
 //   - git refs: `worktree-user` (file) vs `worktree-user/feature` (needs dir)
@@ -235,10 +366,12 @@ function worktreePathFor(repoRoot: string, slug: string): string {
 async function getOrCreateWorktree(
   repoRoot: string,
   slug: string,
-  options?: { prNumber?: number },
+  options?: { prNumber?: number; baseRef?: string },
 ): Promise<WorktreeCreateResult> {
   const worktreePath = worktreePathFor(repoRoot, slug)
   const worktreeBranch = worktreeBranchName(slug)
+
+  await assertSafeWorktreeLocation(repoRoot, worktreePath)
 
   // Fast resume path: if the worktree already exists skip fetch and creation.
   // Read the .git pointer file directly (no subprocess, no upward walk) — a
@@ -255,7 +388,9 @@ async function getOrCreateWorktree(
   }
 
   // New worktree: fetch base branch then add
+  await ensureWorktreesDirExcluded(repoRoot)
   await mkdir(worktreesDir(repoRoot), { recursive: true })
+  await assertSafeWorktreeLocation(repoRoot, worktreePath)
 
   const fetchEnv = { ...process.env, ...GIT_NO_PROMPT_ENV }
 
@@ -274,6 +409,8 @@ async function getOrCreateWorktree(
       )
     }
     baseBranch = 'FETCH_HEAD'
+  } else if (options?.baseRef) {
+    baseBranch = options.baseRef
   } else {
     // If origin/<branch> already exists locally, skip fetch. In large repos
     // (210k files, 16M objects) fetch burns ~6-8s on a local commit-graph
@@ -324,8 +461,14 @@ async function getOrCreateWorktree(
     addArgs.push('--no-checkout')
   }
   // -B (not -b): reset any orphan branch left behind by a removed worktree dir.
-  // Saves a `git branch -D` subprocess (~15ms spawn overhead) on every create.
-  addArgs.push('-B', worktreeBranch, worktreePath, baseBranch)
+  // Use the resolved SHA rather than origin/<branch>; a remote-tracking start
+  // point makes git write branch.<name>.remote/merge into shared .git/config,
+  // which races when multiple agent worktrees start together.
+  addArgs.push('-B', worktreeBranch, worktreePath, baseSha)
+
+  // Fetching may take long enough for the managed directory to be replaced.
+  // Re-check immediately before handing the destination path to git.
+  await assertSafeWorktreeLocation(repoRoot, worktreePath)
 
   const { code: createCode, stderr: createStderr } =
     await execFileNoThrowWithCwd(gitExe(), addArgs, { cwd: repoRoot })
@@ -507,7 +650,7 @@ export async function copyWorktreeIncludeFiles(
  * Post-creation setup for a newly created worktree.
  * Propagates settings.local.json, configures git hooks, and symlinks directories.
  */
-async function performPostCreationSetup(
+export async function performPostCreationSetup(
   repoRoot: string,
   worktreePath: string,
 ): Promise<void> {
@@ -703,7 +846,7 @@ export async function createWorktreeForSession(
   sessionId: string,
   slug: string,
   tmuxSessionName?: string,
-  options?: { prNumber?: number },
+  options?: { prNumber?: number; baseRef?: string },
 ): Promise<WorktreeSession> {
   // Must run before the hook branch below — hooks receive the raw slug as an
   // argument, and the git branch builds a path from it via path.join.
@@ -838,6 +981,13 @@ export async function cleanupWorktree(): Promise<void> {
       // Explicit cwd: process.chdir above does NOT update getCwd() (the state
       // CWD that execFileNoThrow defaults to). If the model cd'd to a non-repo
       // dir, the bare execFileNoThrow variant would fail silently here.
+      const gitRoot = findGitRoot(originalCwd)
+      if (!gitRoot) {
+        throw new Error(
+          `Refusing to remove worktree "${worktreePath}": the original repository cannot be resolved`,
+        )
+      }
+      await assertSafeWorktreeLocation(gitRoot, worktreePath)
       const { code: removeCode, stderr: removeError } =
         await execFileNoThrowWithCwd(
           gitExe(),
@@ -893,19 +1043,65 @@ export async function cleanupWorktree(): Promise<void> {
   }
 }
 
+export type AgentWorktree = {
+  worktreePath: string
+  worktreeBranch?: string
+  headCommit?: string
+  gitRoot?: string
+  hookBased?: boolean
+}
+
+export const AGENT_WORKTREE_UNAVAILABLE_REASON =
+  'the workspace is not a git repository and no WorktreeCreate hook is configured'
+
+/**
+ * Why agent worktree isolation cannot be provisioned here, or null when it can.
+ *
+ * Subagent isolation is an optimization — it keeps parallel writers off each
+ * other's files — not something an agent needs in order to run. A workspace
+ * with no git repository and no WorktreeCreate hook has nothing to isolate
+ * against, so callers degrade to the shared cwd (see
+ * createAgentWorktreeIfSupported) instead of failing every agent they spawn.
+ */
+export function agentWorktreeUnavailableReason(): string | null {
+  if (hasWorktreeCreateHook()) return null
+  if (findCanonicalGitRoot(getCwd())) return null
+  return AGENT_WORKTREE_UNAVAILABLE_REASON
+}
+
+export type AgentWorktreeAttempt =
+  | { worktree: AgentWorktree; unavailableReason?: undefined }
+  | { worktree?: undefined; unavailableReason: string }
+
+/**
+ * Best-effort createAgentWorktree: reports why isolation was skipped instead
+ * of throwing when the workspace has no VCS to provision one from.
+ *
+ * Only that precondition is softened. A repository (or a configured
+ * WorktreeCreate hook) that fails mid-creation still throws: that is a real
+ * failure the caller should surface, not a reason to quietly share the cwd.
+ */
+export async function createAgentWorktreeIfSupported(
+  slug: string,
+): Promise<AgentWorktreeAttempt> {
+  const unavailableReason = agentWorktreeUnavailableReason()
+  if (unavailableReason) {
+    logForDebugging(
+      `Skipping worktree isolation for "${slug}": ${unavailableReason}`,
+      { level: 'warn' },
+    )
+    return { unavailableReason }
+  }
+  return { worktree: await createAgentWorktree(slug) }
+}
+
 /**
  * Create a lightweight worktree for a subagent.
  * Reuses getOrCreateWorktree/performPostCreationSetup but does NOT touch
  * global session state (currentWorktreeSession, process.chdir, project config).
  * Falls back to hook-based creation if not in a git repository.
  */
-export async function createAgentWorktree(slug: string): Promise<{
-  worktreePath: string
-  worktreeBranch?: string
-  headCommit?: string
-  gitRoot?: string
-  hookBased?: boolean
-}> {
+export async function createAgentWorktree(slug: string): Promise<AgentWorktree> {
   validateWorktreeSlug(slug)
 
   // Try hook-based worktree creation first (allows user-configured VCS)
@@ -926,7 +1122,7 @@ export async function createAgentWorktree(slug: string): Promise<{
   const gitRoot = findCanonicalGitRoot(getCwd())
   if (!gitRoot) {
     throw new Error(
-      'Cannot create agent worktree: not in a git repository and no WorktreeCreate hooks are configured. ' +
+      `Cannot create agent worktree: ${AGENT_WORKTREE_UNAVAILABLE_REASON}. ` +
         'Configure WorktreeCreate/WorktreeRemove hooks in settings.json to use worktree isolation with other VCS systems.',
     )
   }
@@ -981,6 +1177,13 @@ export async function removeAgentWorktree(
     logForDebugging('Cannot remove agent worktree: no git root provided', {
       level: 'error',
     })
+    return false
+  }
+
+  try {
+    await assertSafeWorktreeLocation(gitRoot, worktreePath)
+  } catch (error) {
+    logForDebugging(errorMessage(error), { level: 'error' })
     return false
   }
 
@@ -1064,6 +1267,12 @@ export async function cleanupStaleAgentWorktrees(
   }
 
   const dir = worktreesDir(gitRoot)
+  try {
+    await assertSafeWorktreeLocation(gitRoot)
+  } catch (error) {
+    logForDebugging(errorMessage(error), { level: 'error' })
+    return 0
+  }
   let entries: string[]
   try {
     entries = await readdir(dir)
@@ -1082,6 +1291,13 @@ export async function cleanupStaleAgentWorktrees(
 
     const worktreePath = join(dir, slug)
     if (currentPath === worktreePath) {
+      continue
+    }
+
+    try {
+      await assertSafeWorktreeLocation(gitRoot, worktreePath)
+    } catch (error) {
+      logForDebugging(errorMessage(error), { level: 'error' })
       continue
     }
 

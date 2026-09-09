@@ -1,4 +1,5 @@
 import chokidar, { type FSWatcher } from 'chokidar'
+import { getComputerUseConfigPath } from '../computerUse/preauthorizedConfig.js'
 import * as platformPath from 'path'
 import { getAdditionalDirectoriesForClaudeMd } from '../../bootstrap/state.js'
 import {
@@ -14,6 +15,11 @@ import {
   getSkillsPath,
   onDynamicSkillsLoaded,
 } from '../../skills/loadSkillsDir.js'
+import {
+  AGENT_SKILLS_DIR,
+  getUserAgentSkillsDir,
+  isAgentSkillsDirectoryEnabled,
+} from '../../skills/skillRoots.js'
 import { resetSentSkillNames } from '../attachments.js'
 import { registerCleanup } from '../cleanupRegistry.js'
 import { logForDebugging } from '../debug.js'
@@ -168,7 +174,8 @@ export function dispose(): Promise<void> {
  */
 export const subscribe = skillsChanged.subscribe
 
-async function getWatchablePaths(): Promise<string[]> {
+/** Exported for tests: the watch list is otherwise only observable through chokidar. */
+export async function getWatchablePaths(): Promise<string[]> {
   const fs = getFsImplementation()
   const paths: string[] = []
 
@@ -192,6 +199,20 @@ async function getWatchablePaths(): Promise<string[]> {
     } catch {
       // Path doesn't exist, skip it
     }
+  }
+
+  // Computer Use config. Not a skill directory, but the `computer-use` skill's
+  // isEnabled() gate reads it, and the command list is memoized above that gate
+  // — without watching this file, toggling the feature in Settings would leave
+  // the slash menu unchanged until the next restart. The settings page runs in
+  // the server process and cannot invalidate this process's caches, so the file
+  // itself is the only signal that crosses.
+  const computerUseConfigPath = getComputerUseConfigPath()
+  try {
+    await fs.stat(computerUseConfigPath)
+    paths.push(computerUseConfigPath)
+  } catch {
+    // Never toggled the setting; nothing to watch yet.
   }
 
   // Project skills directory (.claude/skills)
@@ -228,6 +249,27 @@ async function getWatchablePaths(): Promise<string[]> {
       paths.push(additionalSkillsPath)
     } catch {
       // Path doesn't exist, skip it
+    }
+  }
+
+  // Cross-client `.agents/skills` roots (user, project, and --add-dir), so a
+  // skill installed by Codex/Cursor shows up without restarting the session.
+  if (isAgentSkillsDirectoryEnabled()) {
+    const agentSkillsPaths = [
+      getUserAgentSkillsDir(),
+      platformPath.resolve(platformPath.join(AGENT_SKILLS_DIR, 'skills')),
+      ...getAdditionalDirectoriesForClaudeMd().map(dir =>
+        platformPath.join(dir, AGENT_SKILLS_DIR, 'skills'),
+      ),
+    ]
+
+    for (const agentSkillsPath of agentSkillsPaths) {
+      try {
+        await fs.stat(agentSkillsPath)
+        paths.push(agentSkillsPath)
+      } catch {
+        // Path doesn't exist, skip it
+      }
     }
   }
 
