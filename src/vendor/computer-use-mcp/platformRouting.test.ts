@@ -1,30 +1,23 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 
 import type {
   ComputerExecutor,
   DisplayGeometry,
   ScreenshotResult,
 } from './executor.js'
-import { createComputerUseMcpServer } from './mcpServer.js'
+import { bindSessionContext, createComputerUseMcpServer } from './mcpServer.js'
+import { NATIVE_CALL_NOT_DISPATCHED } from './toolCalls.js'
+import { resetMouseButtonHeld } from './windowsLegacyToolCalls.js'
 import type {
   ComputerUseHostAdapter,
   ComputerUseSessionContext,
 } from './types.js'
 
 const DARWIN_TOOL_NAMES = [
-  'click',
-  'drag',
-  'get_app_state',
-  'list_apps',
-  'perform_secondary_action',
-  'paste',
-  'press_key',
-  'scroll',
-  'select_text',
-  'set_value',
-  'type_text',
+  'js',
+  'js_reset',
 ].sort()
 
 const WINDOWS_LEGACY_TOOL_NAMES = [
@@ -62,6 +55,8 @@ const logger = {
   warn() {},
   error() {},
 }
+
+afterEach(() => resetMouseButtonHeld())
 
 function makeSessionContext(
   overrides: Partial<ComputerUseSessionContext> = {},
@@ -276,6 +271,288 @@ function makeWindowsAdapter(calls: string[]): ComputerUseHostAdapter {
 }
 
 describe('Computer Use platform routing', () => {
+  test('win32 pre-cancelled single click and key calls never dispatch input', async () => {
+    const calls: string[] = []
+    let tccChecks = 0
+    let lockChecks = 0
+    const adapter = makeWindowsAdapter(calls)
+    adapter.ensureOsPermissions = async () => {
+      tccChecks += 1
+      return { granted: true }
+    }
+    const dispatch = bindSessionContext(
+      adapter,
+      'pixels',
+      makeSessionContext({
+        checkCuLock: async () => {
+          lockChecks += 1
+          return { holder: undefined, isSelf: false }
+        },
+      }),
+    )
+    const controller = new AbortController()
+    controller.abort()
+
+    const results = await Promise.all([
+      dispatch('left_click', { coordinate: [10, 20] }, controller.signal),
+      dispatch('key', { text: 'ctrl+a' }, controller.signal),
+    ])
+
+    expect(calls).not.toContain('click:10,20,left,1')
+    expect(calls).not.toContain('key:ctrl+a')
+    expect(results.every(result => result.isError === true)).toBe(true)
+    expect(tccChecks).toBe(0)
+    expect(lockChecks).toBe(0)
+  })
+
+  test('win32 cancellation while awaiting the lock check never acquires or dispatches', async () => {
+    const calls: string[] = []
+    let releaseLockCheck!: (value: { holder: undefined; isSelf: false }) => void
+    const lockCheck = new Promise<{ holder: undefined; isSelf: false }>(resolve => {
+      releaseLockCheck = resolve
+    })
+    let acquireCount = 0
+    const dispatch = bindSessionContext(
+      makeWindowsAdapter(calls),
+      'pixels',
+      makeSessionContext({
+        checkCuLock: async () => lockCheck,
+        acquireCuLock: async () => { acquireCount += 1 },
+      }),
+    )
+    const controller = new AbortController()
+    const pending = dispatch('key', { text: 'ctrl+a' }, controller.signal)
+
+    controller.abort()
+    releaseLockCheck({ holder: undefined, isSelf: false })
+    const result = await pending
+
+    expect(acquireCount).toBe(0)
+    expect(calls).not.toContain('key:ctrl+a')
+    expect(result.isError).toBe(true)
+  })
+
+  test('win32 cancellation during lock acquisition never dispatches new input', async () => {
+    const calls: string[] = []
+    let acquired = false
+    let enteredAcquire!: () => void
+    let finishAcquire!: () => void
+    const acquiring = new Promise<void>(resolve => { enteredAcquire = resolve })
+    const acquireGate = new Promise<void>(resolve => { finishAcquire = resolve })
+    const dispatch = bindSessionContext(makeWindowsAdapter(calls), 'pixels', makeSessionContext({
+      checkCuLock: async () => acquired
+        ? { holder: 'self', isSelf: true }
+        : { holder: undefined, isSelf: false },
+      acquireCuLock: async () => {
+        enteredAcquire()
+        await acquireGate
+        acquired = true
+      },
+    }))
+    const controller = new AbortController()
+    const pending = dispatch('key', { text: 'ctrl+a' }, controller.signal)
+    await acquiring
+    controller.abort()
+    finishAcquire()
+
+    const result = await pending
+    expect(result.isError).toBe(true)
+    expect(calls).not.toContain('key:ctrl+a')
+  })
+
+  test('win32 cancellation while awaiting OS permissions never dispatches click or key input', async () => {
+    const calls: string[] = []
+    const adapter = makeWindowsAdapter(calls)
+    let permissionsEntered!: () => void
+    let finishPermissions!: (value: { granted: true }) => void
+    const checking = new Promise<void>(resolve => { permissionsEntered = resolve })
+    const permissionGate = new Promise<{ granted: true }>(resolve => { finishPermissions = resolve })
+    adapter.ensureOsPermissions = async () => {
+      permissionsEntered()
+      return permissionGate
+    }
+    const dispatch = bindSessionContext(adapter, 'pixels', makeSessionContext())
+    const controller = new AbortController()
+    const pending = Promise.all([
+      dispatch('left_click', { coordinate: [10, 20] }, controller.signal),
+      dispatch('key', { text: 'ctrl+a' }, controller.signal),
+    ])
+    await checking
+    controller.abort()
+    finishPermissions({ granted: true })
+
+    const results = await pending
+    expect(calls).not.toContain('click:10,20,left,1')
+    expect(calls).not.toContain('key:ctrl+a')
+    expect(results.every(result => result.isError === true)).toBe(true)
+  })
+
+  test('win32 cancellation releases this binder held mouse once without dispatching the requested key', async () => {
+    const calls: string[] = []
+    const dispatch = bindSessionContext(makeWindowsAdapter(calls), 'pixels', makeSessionContext())
+    expect((await dispatch('left_mouse_down', {})).isError).toBeFalsy()
+    const controller = new AbortController()
+    controller.abort()
+
+    expect((await dispatch('key', { text: 'ctrl+a' }, controller.signal)).isError).toBe(true)
+    expect((await dispatch('left_mouse_up', {}, controller.signal)).isError).toBe(true)
+    expect(calls.filter(call => call === 'mouseUp')).toHaveLength(1)
+    expect(calls).not.toContain('key:ctrl+a')
+  })
+
+  test('win32 cancellation cannot release another binder held mouse', async () => {
+    const ownerCalls: string[] = []
+    const otherCalls: string[] = []
+    const owner = bindSessionContext(makeWindowsAdapter(ownerCalls), 'pixels', makeSessionContext())
+    const other = bindSessionContext(makeWindowsAdapter(otherCalls), 'pixels', makeSessionContext())
+    expect((await owner('left_mouse_down', {})).isError).toBeFalsy()
+    const controller = new AbortController()
+    controller.abort()
+
+    expect((await other('left_mouse_up', {}, controller.signal)).isError).toBe(true)
+    expect(otherCalls).not.toContain('mouseUp')
+    await owner('left_mouse_up', {}, controller.signal)
+    expect(ownerCalls.filter(call => call === 'mouseUp')).toHaveLength(1)
+  })
+
+  test('win32 cancellation does not release a held mouse after losing the global lock', async () => {
+    const calls: string[] = []
+    let isSelf = true
+    const dispatch = bindSessionContext(makeWindowsAdapter(calls), 'pixels', makeSessionContext({
+      checkCuLock: async () => ({ holder: isSelf ? 'self' : 'other', isSelf }),
+    }))
+    expect((await dispatch('left_mouse_down', {})).isError).toBeFalsy()
+    const controller = new AbortController()
+    controller.abort()
+    isSelf = false
+
+    expect((await dispatch('left_mouse_up', {}, controller.signal)).isError).toBe(true)
+    expect(calls).not.toContain('mouseUp')
+    isSelf = true
+    await dispatch('left_mouse_up', {}, controller.signal)
+    expect(calls.filter(call => call === 'mouseUp')).toHaveLength(1)
+  })
+
+  test('win32 cancelled mouse release failures stay visible and preserve recovery ownership', async () => {
+    const calls: string[] = []
+    const adapter = makeWindowsAdapter(calls)
+    let releaseAttempts = 0
+    adapter.executor.mouseUp = async () => {
+      releaseAttempts += 1
+      if (releaseAttempts === 1) throw new Error('Windows release fixture failed')
+      calls.push('mouseUp')
+    }
+    const dispatch = bindSessionContext(adapter, 'pixels', makeSessionContext())
+    expect((await dispatch('left_mouse_down', {})).isError).toBeFalsy()
+    const controller = new AbortController()
+    controller.abort()
+
+    const failed = await dispatch('key', { text: 'ctrl+a' }, controller.signal)
+    expect(failed.isError).toBe(true)
+    expect(failed.content).toContainEqual(expect.objectContaining({
+      type: 'text', text: expect.stringContaining('Windows release fixture failed'),
+    }))
+    await dispatch('left_mouse_up', {}, controller.signal)
+    await dispatch('left_mouse_up', {}, controller.signal)
+    expect(releaseAttempts).toBe(2)
+    expect(calls.filter(call => call === 'mouseUp')).toHaveLength(1)
+    expect(calls).not.toContain('key:ctrl+a')
+  })
+
+  test('win32 simultaneous cancelled calls share one owned mouse release', async () => {
+    const calls: string[] = []
+    const adapter = makeWindowsAdapter(calls)
+    let releaseEntered!: () => void
+    let finishRelease!: () => void
+    const releasing = new Promise<void>(resolve => { releaseEntered = resolve })
+    const releaseGate = new Promise<void>(resolve => { finishRelease = resolve })
+    adapter.executor.mouseUp = async () => {
+      calls.push('mouseUp')
+      releaseEntered()
+      await releaseGate
+    }
+    const dispatch = bindSessionContext(adapter, 'pixels', makeSessionContext())
+    await dispatch('left_mouse_down', {})
+    const controller = new AbortController()
+    controller.abort()
+    const first = dispatch('left_mouse_up', {}, controller.signal)
+    await releasing
+    const second = dispatch('left_mouse_up', {}, controller.signal)
+    finishRelease()
+    const results = await Promise.all([first, second])
+
+    expect(results.every(result => result.isError === true)).toBe(true)
+    expect(calls.filter(call => call === 'mouseUp')).toHaveLength(1)
+  })
+
+  test('win32 cancellation during mouse-down releases after completion without claiming no dispatch', async () => {
+    const calls: string[] = []
+    const adapter = makeWindowsAdapter(calls)
+    let downEntered!: () => void
+    let finishDown!: () => void
+    const entering = new Promise<void>(resolve => { downEntered = resolve })
+    const downGate = new Promise<void>(resolve => { finishDown = resolve })
+    adapter.executor.mouseDown = async () => {
+      calls.push('mouseDown')
+      downEntered()
+      await downGate
+    }
+    const dispatch = bindSessionContext(adapter, 'pixels', makeSessionContext())
+    const controller = new AbortController()
+    const pending = dispatch('left_mouse_down', {}, controller.signal)
+    await entering
+    controller.abort()
+    finishDown()
+
+    const result = await pending
+    expect(calls.filter(call => ['mouseDown', 'mouseUp'].includes(call))).toEqual(['mouseDown', 'mouseUp'])
+    expect(result.isError).toBe(true)
+    expect(result[NATIVE_CALL_NOT_DISPATCHED]).not.toBe(true)
+  })
+
+  test('win32 mid-batch cancellation releases its held mouse and skips later actions', async () => {
+    const calls: string[] = []
+    const adapter = makeWindowsAdapter(calls)
+    const controller = new AbortController()
+    adapter.executor.mouseDown = async () => {
+      calls.push('mouseDown')
+      controller.abort()
+    }
+    const dispatch = bindSessionContext(adapter, 'pixels', makeSessionContext())
+    const result = await dispatch('computer_batch', {
+      actions: [{ action: 'left_mouse_down' }, { action: 'key', text: 'ctrl+a' }],
+    }, controller.signal)
+
+    expect(result.isError).toBe(true)
+    expect(calls.filter(call => ['mouseDown', 'mouseUp'].includes(call))).toEqual(['mouseDown', 'mouseUp'])
+    expect(calls).not.toContain('key:ctrl+a')
+  })
+
+  test('win32 mid-batch cancellation cannot release its mouse after losing the global lock', async () => {
+    const calls: string[] = []
+    const adapter = makeWindowsAdapter(calls)
+    const controller = new AbortController()
+    let isSelf = true
+    adapter.executor.mouseDown = async () => {
+      calls.push('mouseDown')
+      isSelf = false
+      controller.abort()
+    }
+    const dispatch = bindSessionContext(adapter, 'pixels', makeSessionContext({
+      checkCuLock: async () => ({ holder: isSelf ? 'self' : 'other', isSelf }),
+    }))
+    const result = await dispatch('computer_batch', {
+      actions: [{ action: 'left_mouse_down' }, { action: 'key', text: 'ctrl+a' }],
+    }, controller.signal)
+
+    expect(result.isError).toBe(true)
+    expect(calls).not.toContain('mouseUp')
+    expect(calls).not.toContain('key:ctrl+a')
+    isSelf = true
+    await dispatch('left_mouse_up', {}, controller.signal)
+    expect(calls.filter(call => call === 'mouseUp')).toHaveLength(1)
+  })
+
   test('darwin ListTools advertises the current semantic tools', async () => {
     const connection = await connect(makeDarwinAdapter())
     try {
@@ -336,6 +613,7 @@ describe('Computer Use platform routing', () => {
         WINDOWS_LEGACY_TOOL_NAMES,
       )
       expect(result.tools.some(tool => tool.name === 'get_app_state')).toBe(false)
+      expect(result.tools.some(tool => tool.name === 'sequence')).toBe(false)
       expect(result.tools.some(tool => tool.name === 'request_access')).toBe(false)
       expect(result.tools.some(tool => tool.name === 'list_granted_applications')).toBe(false)
     } finally {

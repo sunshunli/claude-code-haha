@@ -4,6 +4,7 @@ import { lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
+  __connectWithRetryForTests,
   __prepareDaemonSocketDirectoryForTests,
   __resetDaemonClientForTests,
   __daemonStartCountForTests,
@@ -69,6 +70,48 @@ afterEach(() => {
 })
 
 describe('cu-helper daemon system commands', () => {
+  test('readiness deadline also bounds a socket that never emits connect or error', async () => {
+    const socket = new FakeSocket()
+    let attempts = 0
+    const request = __connectWithRetryForTests('/fixture/never-connects.sock', 20, () => {
+      attempts++
+      return socket as never
+    }).catch(error => error)
+    let guard: ReturnType<typeof setTimeout> | undefined
+    const result = await Promise.race([
+      request,
+      new Promise<string>(resolve => { guard = setTimeout(() => resolve('still pending'), 150) }),
+    ])
+    clearTimeout(guard)
+    expect(result).toBeInstanceOf(Error)
+    expect(result.message).toMatch(/socket not ready within 20ms/)
+    expect(attempts).toBe(1)
+    expect(socket.destroyed).toBe(true)
+    expect(socket.listenerCount('connect')).toBe(0)
+  })
+
+  test('readiness deadline is cleared after connecting successfully', async () => {
+    const socket = new FakeSocket()
+    const request = __connectWithRetryForTests('/fixture/ready.sock', 20, () => {
+      queueMicrotask(() => socket.emit('connect'))
+      return socket as never
+    })
+    expect(await request).toBe(socket as never)
+    await new Promise(resolve => setTimeout(resolve, 35))
+    expect(socket.destroyed).toBe(false)
+  })
+
+  test('a socket that closes before connecting is retired within the readiness deadline', async () => {
+    const socket = new FakeSocket()
+    const request = __connectWithRetryForTests('/fixture/closed.sock', 20, () => {
+      queueMicrotask(() => socket.emit('close'))
+      return socket as never
+    })
+    await expect(request).rejects.toThrow(/socket closed before connecting/)
+    expect(socket.destroyed).toBe(true)
+    expect(socket.listenerCount('connect')).toBe(0)
+  })
+
   test('uses trusted absolute binaries for process probing and LaunchServices', async () => {
     const { __daemonProcessCommandsForTests } = await import('./cuHelperDaemon.js')
     expect(
@@ -179,13 +222,14 @@ describe('cu-helper daemon failure classification', () => {
     await waitForWrite(socket)
     const id = JSON.parse(socket.writes[0]!).id
     socket.emit('data', Buffer.from(
-      `${JSON.stringify({ id, ok: false, error: { message: 'grant_flag_required' } })}\n`,
+      `${JSON.stringify({ id, ok: false, error: { message: 'grant_flag_required', code: 'not_trusted' } })}\n`,
     ))
 
     const error = await request
     expect(error).toBeInstanceOf(Error)
     expect(error).not.toBeInstanceOf(DaemonUnavailableError)
     expect(error.message).toBe('grant_flag_required')
+    expect(error.nativeCode).toBe('not_trusted')
   })
 
   test('every request carries negotiated protocol, deadline, and stable turn identity', async () => {

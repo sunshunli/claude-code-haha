@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import { _test as deniedApps } from './deniedApps.js'
+import { NATIVE_FORBIDDEN_BUNDLE_IDS } from './nativeAppPolicy.js'
 
 const SWIFT_SET_MARKER = 'static let deniedBundleIDs: Set<String> = ['
 const SWIFT_INTRINSIC_SET_MARKER = 'static let intrinsicDeniedBundleIDs: Set<String> = ['
@@ -19,13 +20,8 @@ function parseNativeDeniedBundleIds(source: string, marker: string): string[] {
   return [...body.matchAll(/^\s*"([^"]+)",?\s*(?:\/\/.*)?$/gm)].map(match => match[1])
 }
 
-test('native AppTargetPolicy deny set stays in exact parity with deniedApps bundle sets', () => {
-  const tsEntries = [
-    deniedApps.BROWSER_BUNDLE_IDS,
-    deniedApps.TERMINAL_BUNDLE_IDS,
-    deniedApps.TRADING_BUNDLE_IDS,
-    deniedApps.POLICY_DENIED_BUNDLE_IDS,
-  ].flatMap(entries => [...entries])
+test('native deny policy matches the official 24 exact forbidden identities', () => {
+  const tsEntries = [...NATIVE_FORBIDDEN_BUNDLE_IDS]
   const expected = new Set(tsEntries)
 
   const swiftPath = resolve(
@@ -43,11 +39,15 @@ test('native AppTargetPolicy deny set stays in exact parity with deniedApps bund
 
   expect(tsEntries).toHaveLength(expected.size)
   expect(nativeEntries).toHaveLength(actual.size)
-  expect(expected.size).toBe(107)
-  expect(actual.size).toBe(107)
+  expect(expected.size).toBe(24)
+  expect(actual.size).toBe(24)
   expect(missing).toEqual([])
   expect(extra).toEqual([])
   expect([...actual].sort()).toEqual([...expected].sort())
+  // Browser classification still exists for the Windows tool tier. Native
+  // macOS control may use the same browser as the official Codex app surface.
+  expect(deniedApps.BROWSER_BUNDLE_IDS.size).toBe(29)
+  expect([...deniedApps.BROWSER_BUNDLE_IDS].filter(bundleId => actual.has(bundleId))).toEqual([])
 })
 
 test('native intrinsic deny set stays separate and matches the TS host/helper defaults', () => {

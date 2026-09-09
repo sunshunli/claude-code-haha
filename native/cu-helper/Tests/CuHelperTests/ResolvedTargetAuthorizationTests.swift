@@ -12,6 +12,59 @@ final class ResolvedTargetAuthorizationTests: XCTestCase {
         executablePath: "/System/Applications/Calculator.app/Contents/MacOS/Calculator",
         launchTime: 200
     )
+    private let chromeIdentity = AXTreeProcessIdentity(
+        bundleID: "com.google.Chrome",
+        executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        launchTime: 300
+    )
+
+    func testChromePIDBundleNameAndPathSelectorsPreserveExactProvenIdentity() throws {
+        let chrome = AppTargetCandidate(
+            pid: 43,
+            bundleIdentifier: "com.google.Chrome",
+            bundleURL: URL(fileURLWithPath: "/Applications/Google Chrome.app"),
+            localizedName: "Google Chrome",
+            executableName: "Google Chrome"
+        )
+        let selectors: [AppTargetSelector] = [
+            .pid(43),
+            .bundleIdentifier("com.google.Chrome"),
+            .app("com.google.Chrome"),
+            .app("Google Chrome"),
+            .app("Google Chrome.app"),
+            .app("/Applications/Google Chrome.app"),
+        ]
+
+        for selector in selectors {
+            let resolved = try XCTUnwrap(
+                AppTargetResolver.resolve(selector: selector, candidates: [chrome])
+            )
+            let target = try ResolvedTargetAuthorization.authorize(
+                resolved: resolved,
+                currentIdentity: chromeIdentity
+            )
+            XCTAssertEqual(target.pid, chrome.pid)
+            XCTAssertEqual(target.identity, chromeIdentity)
+        }
+    }
+
+    func testAllowingChromeStillRejectsUnprovenOrMismatchedIdentity() {
+        let unproven = AXTreeProcessIdentity(
+            bundleID: chromeIdentity.bundleID,
+            executablePath: chromeIdentity.executablePath,
+            launchTime: nil
+        )
+        XCTAssertThrowsError(try ResolvedTargetAuthorization.authorize(
+            pid: 43, identity: unproven, expectedBundleID: "com.google.Chrome"
+        )) {
+            XCTAssertEqual(($0 as? CUError)?.code, "app_denied")
+        }
+        XCTAssertThrowsError(try ResolvedTargetAuthorization.authorize(
+            pid: 43, identity: terminalIdentity, expectedBundleID: "com.google.Chrome"
+        )) {
+            XCTAssertEqual(($0 as? CUError)?.code, "stale_process")
+        }
+    }
 
     func testNumericPIDCannotBypassDeniedResolvedBundle() {
         XCTAssertThrowsError(

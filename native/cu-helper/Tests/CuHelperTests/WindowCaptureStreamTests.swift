@@ -707,7 +707,7 @@ final class WindowCaptureStreamTests: XCTestCase {
         ))
     }
 
-    func testCopiedBGRAFrameEncodesAsAStreamPNGWithTheSameGeometry() throws {
+    func testCopiedBGRAFrameEncodesAsAStreamJPEGWithTheSameGeometry() throws {
         let target = makeTarget(
             windowID: 72,
             pixelWidth: 1,
@@ -725,9 +725,9 @@ final class WindowCaptureStreamTests: XCTestCase {
         )
 
         let shot = try XCTUnwrap(Capture.windowShot(from: frame, target: target))
-        let png = try XCTUnwrap(Data(base64Encoded: shot.base64))
+        let jpeg = try XCTUnwrap(Data(base64Encoded: shot.base64))
 
-        XCTAssertEqual(Array(png.prefix(8)), [137, 80, 78, 71, 13, 10, 26, 10])
+        XCTAssertEqual(Array(jpeg.prefix(2)), [255, 216])
         XCTAssertEqual(shot.width, 1)
         XCTAssertEqual(shot.height, 1)
         XCTAssertEqual(shot.originX, 300)

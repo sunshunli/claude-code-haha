@@ -351,9 +351,6 @@ public enum AXAction {
     /// Max UTF-16 units per `keyboardSetUnicodeString` chunk (blueprint §4 ≤64).
     private static let unicodeChunk = 64
 
-    /// Lines scrolled per "page" for the synthetic-wheel fallback (blueprint §4).
-    private static let linesPerPage = 12
-
     /// How far down to scan for an actionable descendant (blueprint §4: "向下3层").
     private static let descendantScanDepth = 3
 
@@ -767,6 +764,27 @@ public enum AXAction {
             throw CUError("invalid_action", "\(action) is not a valid secondary action for \(index)")
         }
 
+        // Official UIElementProtocol.perform prioritizes native scroll-bar
+        // page buttons. AppKit may advertise AXScroll…ByPage on the area while
+        // rejecting a direct AXPerformAction; the page button still works.
+        if let navigation = NativeScroll.pageNavigation(action: raw),
+           let bar = copyElement(element, navigation.axisAttribute),
+           let button = children(of: bar).first(where: {
+               stringAttribute($0, kAXRoleAttribute) == (kAXButtonRole as String)
+                   && stringAttribute($0, kAXSubroleAttribute) == navigation.buttonSubrole
+           }) {
+            var buttonPID: pid_t = 0
+            guard AXUIElementGetPid(button, &buttonPID) == .success, buttonPID == pid else {
+                throw CUError("stale_element", "The scroll page button no longer belongs to the target process")
+            }
+            let error = AXUIElementPerformAction(button, kAXPressAction as CFString)
+            guard error == .success else {
+                throw CUError("ax_failed", "The scroll page button rejected AXPress (AXError \(error.rawValue))")
+            }
+            settle()
+            return
+        }
+
         let err = AXUIElementPerformAction(element, raw as CFString)
         guard err == .success else {
             throw CUError("ax_failed", "perform_secondary_action(\(raw)) failed (AXError \(err.rawValue)) on element \(index)")
@@ -778,9 +796,9 @@ public enum AXAction {
 
     /// Scroll the element at `index` (preferred) — or, if `index` is nil, the
     /// element under the given GLOBAL point — `pages` pages in `direction`
-    /// (up/down/left/right). Element-domain first: repeat `AXScroll{Up,Down,Left,
-    /// Right}ByPage` floor(pages) times if the element exposes it; else synthesize a
-    /// wheel event at the element center (12 lines/page) via `postToPid`.
+    /// (up/down/left/right). Fractional pages become precise pixel deltas using
+    /// the addressed element's frame, or the whole window for coordinates.
+    /// AX Scroll…ByPage remains available as a distinct secondary action.
     public static func scroll(
         pid: pid_t,
         index: Int?,
@@ -798,28 +816,15 @@ public enum AXAction {
         }
 
         // Resolve the target element (by index) and its center, or a bare point.
-        var element: AXUIElement?
+        var elementFrame: CGRect?
         var center: CGPoint?
         if let index {
-            element = try resolveElement(pid: pid, index: index)
-            center = centerGlobal(AXTree.record(pid: pid, index: index))
+            let element = try resolveElement(pid: pid, index: index)
+            elementFrame = AXTree.frameRect(element)
+            center = elementFrame.map { CGPoint(x: $0.midX, y: $0.midY) }
         }
         if center == nil, let x, let y {
             center = CGPoint(x: x, y: y)
-        }
-
-        // ── Element domain: AXScroll…ByPage, floor(pages) repeats. ────────────
-        let wholePages = Int(pages.rounded(.down))
-        if wholePages >= 1, let element {
-            let pageAction = "AXScroll\(dir.capitalized)ByPage" // AXScrollUpByPage, …
-            if actionNames(element).contains(pageAction) {
-                for _ in 0..<wholePages {
-                    _ = AXUIElementPerformAction(element, pageAction as CFString)
-                    try await Task.sleep(for: .milliseconds(50))
-                }
-                settle()
-                return
-            }
         }
 
         // ── Synthetic wheel at the element center (or point). ─────────────────
@@ -834,7 +839,13 @@ public enum AXAction {
         guard WindowGeometry.window(id: window.id, pid: pid) == window else {
             throw CUError("stale_window", "The scroll target moved or closed. Read its current state before retrying.")
         }
-        try scrollWheel(at: point, direction: dir, pages: pages, pid: pid)
+        let delta = try NativeScroll.delta(direction: dir, pages: pages, frameSize: (elementFrame ?? window.bounds).size)
+        guard let eventSource,
+              let event = WindowTargetedEvent.makeScrollEvent(
+                source: eventSource, point: point, deltaX: delta.x, deltaY: delta.y, window: window
+              ) else { throw CUError(CUError.Code.eventAlloc, "Failed to allocate a marked pixel scroll event") }
+        try Task.checkCancellation()
+        WindowTargetedEvent.post(event, to: pid)
         settle()
     }
 
@@ -940,11 +951,12 @@ public enum AXAction {
     static func pasteText(
         pid: pid_t,
         _ text: String,
-        format: ClipboardPasteFormat
+        format: ClipboardPasteFormat,
+        lease: ClipboardLease? = nil
     ) async throws {
         guard !text.isEmpty else { return }
         let target = try Injection.authorizeResolvedTarget(pid: pid)
-        try await typeViaClipboard(target: target, text, format: format)
+        try await typeViaClipboard(target: target, text, format: format, lease: lease)
     }
 
     /// Paste `text` into whatever holds in-app keyboard focus in `pid`, via the
@@ -954,13 +966,15 @@ public enum AXAction {
     private static func typeViaClipboard(
         target: ProvenProcessTarget,
         _ text: String,
-        format: ClipboardPasteFormat = .text
+        format: ClipboardPasteFormat = .text,
+        lease: ClipboardLease? = nil
     ) async throws {
         let pid = target.pid
         try await ClipboardPasteReceipt.perform(
             text: text,
             format: format,
-            lease: ClipboardLease()
+            lease: lease ?? ClipboardLease(),
+            targetPID: pid
         ) { validate in
             try await pressKey(pid: pid, "super+v", validateBeforePosting: {
                 _ = try Injection.validateAuthorizedTarget(target)
@@ -1016,7 +1030,7 @@ public enum AXAction {
     // MARK: - Drag
 
     /// Synthetic left-button (or `button`) drag between two GLOBAL points: down at
-    /// `from`, ten interpolated dragged steps, up at `to`. Posted to the window
+    /// `from`, dragged at the origin/midpoint/destination, up at `to`. Posted to the window
     /// explicitly resolved target via `postToPid`. Coordinate-only by contract —
     /// the model drives drags by pixel, not by element index.
     public static func drag(pid: pid_t, from: CGPoint, to: CGPoint, button: MouseButton = .left) async throws {
@@ -1032,20 +1046,29 @@ public enum AXAction {
         let target = try Injection.authorizeResolvedTarget(pid: pid)
         let focusReceipt = try await ensureTargetAcceptsInput(pid: pid, window: dragWindow)
 
-        // Movement carries clickState 0 (both the leading move and every
-        // dragged step); only the press and the release belong to the click.
-        // The press and release bracket one gesture and share a number; every
-        // movement in between shares a second one.
+        let events = try dragEvents(
+            from: from, to: to, button: button,
+            source: src, pid: pid, window: dragWindow
+        )
+        try await postMouseBurst(
+            events, target: target, window: dragWindow, button: button,
+            focusReceipt: focusReceipt, pause: nil
+        )
+    }
+
+    static func dragEvents(
+        from: CGPoint, to: CGPoint, button: MouseButton,
+        source: CGEventSource, pid: pid_t, window: WindowGeometry.Window
+    ) throws -> [CGEvent] {
+        // Match the installed official SkyComputerUseService 26.831.1000926
+        // SynthesizedEvent.click implementation: down, dragged at origin,
+        // dragged at midpoint, dragged at destination, up. A zero-distance
+        // drag retains all five events. This is a drag gesture, not a click.
+        // Motion carries clickState 0 and a shared event number; down/up carry
+        // clickState 1 and a different shared number.
         let gestureNumber = WindowTargetedEvent.nextEventNumber()
         let motionNumber = WindowTargetedEvent.nextEventNumber()
         var specs = [
-            MouseBurstSpec(
-                type: .mouseMoved,
-                point: from,
-                button: button,
-                clickState: mouseClickState(for: .mouseMoved, click: 1),
-                eventNumber: motionNumber
-            ),
             MouseBurstSpec(
                 type: button.down,
                 point: from,
@@ -1054,12 +1077,11 @@ public enum AXAction {
                 eventNumber: gestureNumber
             ),
         ]
-        for step in 1...10 {
-            let t = CGFloat(step) / 10
-            let p = CGPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t)
+        let midpoint = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2)
+        for point in [from, midpoint, to] {
             specs.append(MouseBurstSpec(
                 type: button.dragged,
-                point: p,
+                point: point,
                 button: button,
                 clickState: mouseClickState(for: button.dragged, click: 1),
                 eventNumber: motionNumber
@@ -1072,23 +1094,21 @@ public enum AXAction {
             clickState: mouseClickState(for: button.up, click: 1),
             eventNumber: gestureNumber
         ))
-        let events: [CGEvent] = try EventBurst.allocateAll(
+        return try EventBurst.allocateAll(
             specs: specs
         ) { spec in
-            makeMouse(spec, source: src, targetPid: pid, window: dragWindow)
+            makeMouse(spec, source: source, targetPid: pid, window: window)
         }
-        try await postMouseBurst(
-            events, target: target, window: dragWindow, button: button, focusReceipt: focusReceipt
-        )
     }
 
     private static func postMouseBurst(
         _ events: [CGEvent], target: ProvenProcessTarget,
         window: WindowGeometry.Window, button: MouseButton,
         focusReceipt: FocusEventMonitor.RegistrationReceipt,
-        pause: (@MainActor () async throws -> Void)? = {
-            try await Task.sleep(for: .milliseconds(30))
-        }
+        // The official coordinate click/drag controller supplies no per-event
+        // delay to sendClick. Preserve an injectable seam for paced callers,
+        // without imposing the old 30 ms sleep on every coordinate event.
+        pause: (@MainActor () async throws -> Void)? = nil
     ) async throws {
         try await MouseEventBurstDelivery.deliver(
             events: events,
@@ -1310,44 +1330,6 @@ public enum AXAction {
             out.append(ch)
         }
         return out
-    }
-
-    // MARK: Scroll synthesis
-
-    /// Synthetic scroll-wheel event at a GLOBAL point, `pages` pages in `direction`
-    /// (12 lines/page). Vertical on wheel1, horizontal on wheel2; posted to the
-    /// window owner via `postToPid`.
-    private static func scrollWheel(at point: CGPoint, direction: String, pages: Double, pid: pid_t) throws {
-        let magnitude = Int32(clamping: Int((Double(linesPerPage) * pages).rounded(.toNearestOrAwayFromZero)))
-        let amount = max(1, magnitude)
-        // Quartz wheel sign: +up / -down (vertical), +left / -right (horizontal).
-        let wheel1: Int32 = direction == "up" ? amount : (direction == "down" ? -amount : 0)
-        let wheel2: Int32 = direction == "left" ? amount : (direction == "right" ? -amount : 0)
-        guard let eventSource else {
-            throw CUError(
-                CUError.Code.eventAlloc,
-                "Failed to allocate a marked scroll-wheel event source"
-            )
-        }
-        guard let event = CGEvent(
-            scrollWheelEvent2Source: eventSource,
-            units: .line,
-            wheelCount: 2,
-            wheel1: wheel1,
-            wheel2: wheel2,
-            wheel3: 0
-        ) else {
-            throw CUError(CUError.Code.eventAlloc, "Failed to allocate a scroll-wheel event")
-        }
-        event.location = point
-        // Same window binding the click path needs: Chromium routes scroll by
-        // the window the event claims, so an unbound wheel event is discarded.
-        if let window = WindowGeometry.window(at: point, pid: pid) {
-            event.setIntegerValueField(CGEventField(rawValue: 91)!, value: Int64(window.id))
-            event.setIntegerValueField(CGEventField(rawValue: 92)!, value: Int64(window.id))
-        }
-        WindowTargetedEvent.post(event, to: pid)
-        Thread.sleep(forTimeInterval: 0.1)
     }
 
     // MARK: Keyboard helpers

@@ -57,6 +57,10 @@ struct WindowShot: Sendable {
     let pointHeight: Double
     let windowID: CGWindowID
     let source: WindowShotCaptureSource
+    /// Uniform capture fit before integer pixel-buffer rounding. Legacy shots
+    /// may omit this and retain their dimension-derived transform.
+    var pixelsPerPoint: Double? = nil
+    var mimeType: String { NativeScreenshotPolicy.mimeType }
 }
 
 @available(macOS 14.0, *)
@@ -442,20 +446,19 @@ public enum Capture {
     /// - Parameters:
     ///   - pid: the target application's process id (the app whose AX tree
     ///     `get_app_state` just rendered).
-    ///   - scale: output downscale factor applied to the window's native pixel
-    ///     size. `0.5` (the blueprint default) halves each axis. Values `<= 0`
-    ///     are coerced to `0.5`.
+    ///   - scale: an explicit factor applied to native pixels; nil uses the
+    ///     native App policy (point resolution, long/short side limits).
     /// - Returns: `(base64, width, height, originX, originY, pointWidth,
-    ///   pointHeight, windowID)` — the PNG in screenshot-pixel space (top-left origin)
+    ///   pointHeight, windowID)` — the JPEG in screenshot-pixel space (top-left origin)
     ///   PLUS the captured window's GLOBAL Quartz top-left origin and its size
-    ///   in POINTS. The caller uses `(originX, originY)` + `imgWidth/pointWidth`
-    ///   (pixels-per-point) to invert image-pixel coordinates back into the
+    ///   in POINTS. The caller uses the uniform `pixelsPerPoint` capture fit
+    ///   to invert image-pixel coordinates back into the
     ///   global-point space that clicks/cursor/glow all live in. `nil` on any
     ///   failure. Never throws; never prompts.
     static func windowShot(
         pid: pid_t,
         preferredWindowID: CGWindowID? = nil,
-        scale: Double = 0.5,
+        scale: Double? = nil,
         allowCLIFallback: Bool = true
     ) async -> WindowShot? {
         // Passive permission gate — no prompt on the hot path. A denied grant
@@ -468,7 +471,10 @@ public enum Capture {
             preferredWindowID: preferredWindowID
         ) else { return nil }
 
-        let outputScale = scale > 0 ? scale : 0.5
+        let backingScale = backingScaleFactor(forWindowFrame: target.frame)
+        let outputScale = scale.flatMap { $0 > 0 ? $0 : nil } ?? NativeScreenshotPolicy.scale(
+            pointSize: target.frame.size, backingScale: backingScale
+        )
         // The captured window's global Quartz top-left frame (points). Threaded
         // to every return point so the caller can build the inverse transform.
         let f = target.frame
@@ -479,7 +485,7 @@ public enum Capture {
             frame: target.frame,
             scale: outputScale
         ) {
-            if let encoded = pngBase64WithSize(image) {
+            if let encoded = appScreenshotBase64WithSize(image) {
                 return WindowShot(
                     base64: encoded.base64,
                     width: encoded.width,
@@ -489,10 +495,11 @@ public enum Capture {
                     pointWidth: Double(f.width),
                     pointHeight: Double(f.height),
                     windowID: target.windowID,
-                    source: .screenshotManager
+                    source: .screenshotManager,
+                    pixelsPerPoint: backingScale * outputScale
                 )
             }
-            // SCK produced pixels but PNG/base64 failed — degrade to `nil`
+            // SCK produced pixels but image encoding failed — degrade to `nil`
             // rather than re-capturing; the caller still gets AX text.
             return nil
         }
@@ -500,8 +507,9 @@ public enum Capture {
         guard allowCLIFallback else { return nil }
         // ② Fallback: /usr/sbin/screencapture -l <windowID> (SCK hung or failed).
         if let raw = screencaptureWindow(windowID: target.windowID) {
-            let scaled = (try? scaleImage(raw, scale: outputScale)) ?? raw
-            if let encoded = pngBase64WithSize(scaled) {
+            let scaledImage = try? scaleImage(raw, scale: outputScale)
+            let scaled = scaledImage ?? raw
+            if let encoded = appScreenshotBase64WithSize(scaled) {
                 return WindowShot(
                     base64: encoded.base64,
                     width: encoded.width,
@@ -511,7 +519,8 @@ public enum Capture {
                     pointWidth: Double(f.width),
                     pointHeight: Double(f.height),
                     windowID: target.windowID,
-                    source: .screenCaptureCLI
+                    source: .screenCaptureCLI,
+                    pixelsPerPoint: scaledImage == nil ? nil : backingScale * outputScale
                 )
             }
         }
@@ -766,8 +775,8 @@ public enum Capture {
     /// the caller can fall back to the unscaled image.
     private static func scaleImage(_ image: CGImage, scale: Double) throws -> CGImage {
         guard scale > 0, scale != 1.0 else { return image }
-        let outW = max(1, Int((Double(image.width) * scale).rounded()))
-        let outH = max(1, Int((Double(image.height) * scale).rounded()))
+        let outW = max(1, Int(ceil(Double(image.width) * scale)))
+        let outH = max(1, Int(ceil(Double(image.height) * scale)))
         if outW == image.width && outH == image.height { return image }
 
         guard let colorSpace = image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB) else {
@@ -792,19 +801,18 @@ public enum Capture {
         return scaled
     }
 
-    /// Encode a `CGImage` to base64 **PNG** plus its actual pixel dimensions.
-    /// `get_app_state`'s MCP envelope uses `mimeType: "image/png"`, so unlike the
-    /// JPEG `screenshot` path this is lossless PNG. Returns `nil` on any encode
-    /// failure (never throws) so `windowShot` degrades to AX-text-only.
-    static func pngBase64WithSize(
+    /// Native App screenshots use the official default JPEG quality. The
+    /// byte format is reported explicitly instead of relying on a fixed MIME
+    /// label in a downstream wrapper. Encoding failure degrades to AX text.
+    static func appScreenshotBase64WithSize(
         _ image: CGImage
     ) -> (base64: String, width: Int, height: Int)? {
         let data = NSMutableData()
-        let type = UTType.png.identifier as CFString
+        let type = UTType.jpeg.identifier as CFString
         guard let dest = CGImageDestinationCreateWithData(data, type, 1, nil) else {
             return nil
         }
-        CGImageDestinationAddImage(dest, image, nil)
+        CGImageDestinationAddImage(dest, image, [kCGImageDestinationLossyCompressionQuality: NativeScreenshotPolicy.jpegQuality] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return (
             (data as Data).base64EncodedString(),

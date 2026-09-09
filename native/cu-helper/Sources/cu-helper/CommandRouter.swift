@@ -67,11 +67,13 @@ enum SnapshotProcessGuard {
 /// serialises to `{ ok: false, error: { message, code } }`.
 @MainActor
 public final class CommandRouter {
+    typealias PasteExecutor = @MainActor (pid_t, String, ClipboardPasteFormat) async throws -> Void
     private let cursor: VirtualCursor
     private let capabilities: Capabilities
     private let inputMonitor: PhysicalInputEpochMonitor
     private let foregroundRuntime: ForegroundLeaseRuntime
     private let windowCaptureProvider: (any WindowCaptureProviding)?
+    private let pasteExecutor: PasteExecutor
 
     /// After a left `mouse_down` (decomposed drag) the held point is parked
     /// here so a following `mouse_up` releases at the same logical location.
@@ -84,13 +86,17 @@ public final class CommandRouter {
         cursor: VirtualCursor,
         capabilities: Capabilities,
         inputMonitor: PhysicalInputEpochMonitor,
-        windowCaptureProvider: (any WindowCaptureProviding)? = nil
+        windowCaptureProvider: (any WindowCaptureProviding)? = nil,
+        pasteExecutor: @escaping PasteExecutor = { pid, text, format in
+            try await AXAction.pasteText(pid: pid, text, format: format)
+        }
     ) {
         self.cursor = cursor
         self.capabilities = capabilities
         self.inputMonitor = inputMonitor
         self.foregroundRuntime = .live(monitor: inputMonitor)
         self.windowCaptureProvider = windowCaptureProvider
+        self.pasteExecutor = pasteExecutor
     }
 
     func resetHeldSessionState() {
@@ -229,9 +235,10 @@ public final class CommandRouter {
         case "list_installed_apps":
             return try encode(Apps.listInstalled())
 
-        case "list_running_apps", "list_apps":
-            // `list_apps` is the Codex-parity contract name; `list_running_apps`
-            // is the legacy bridge name. Both enumerate targetable running apps.
+        case "list_apps":
+            return try encode(await Apps.listApps())
+
+        case "list_running_apps":
             return try encode(Apps.listRunning())
 
         case "resolve_app_target":
@@ -747,7 +754,7 @@ public final class CommandRouter {
                     pid: pid,
                     processIdentity: snapshotEvidence.processIdentity,
                     preferredWindowID: snapshotEvidence.keyWindowID,
-                    scale: 0.5,
+                    scale: nil,
                     newerThanUptime: pendingMutation
                 )
             }
@@ -782,7 +789,7 @@ public final class CommandRouter {
                 shot = await Capture.windowShot(
                     pid: pid,
                     preferredWindowID: snapshotEvidence.keyWindowID,
-                    scale: 0.5
+                    scale: nil
                 )
             } else {
                 // A one-shot capture can repeat compositor-cached pixels for a
@@ -847,8 +854,9 @@ public final class CommandRouter {
                 ) {
                     Self.appendAXNotice(notice, to: &object)
                 }
-                object["screenshot"] = .object([
+                var screenshot: [String: JSONValue] = [
                     "base64": .string(shot.base64),
+                    "mimeType": .string(shot.mimeType),
                     "width": .int(shot.width),
                     "height": .int(shot.height),
                     "originX": .double(shot.originX),
@@ -857,7 +865,11 @@ public final class CommandRouter {
                     "pointHeight": .double(shot.pointHeight),
                     "windowID": .int(Int(shot.windowID)),
                     "captureSource": .string(shot.source.rawValue),
-                ])
+                ]
+                if let pixelsPerPoint = shot.pixelsPerPoint {
+                    screenshot["pixelsPerPoint"] = .double(pixelsPerPoint)
+                }
+                object["screenshot"] = .object(screenshot)
                 // Cache the inverse transform so a later coordinate click/scroll/
                 // drag (which arrives in image-pixel space) can be mapped back to
                 // global points. `ppp` = image pixels per window point.
@@ -871,7 +883,8 @@ public final class CommandRouter {
                         imageWidth: shot.width,
                         imageHeight: shot.height,
                         processIdentity: snapshotEvidence.processIdentity,
-                        windowID: shot.windowID
+                        windowID: shot.windowID,
+                        pixelsPerPoint: shot.pixelsPerPoint
                     )
                 }
             }
@@ -932,7 +945,8 @@ public final class CommandRouter {
         imageWidth: Int,
         imageHeight: Int,
         processIdentity: AXTreeProcessIdentity,
-        windowID: CGWindowID
+        windowID: CGWindowID,
+        pixelsPerPoint: Double? = nil
     ) {
         guard pid > 0,
               processIdentity.isProven,
@@ -943,6 +957,7 @@ public final class CommandRouter {
               pointHeight.isFinite,
               pointWidth > 0,
               pointHeight > 0,
+              pixelsPerPoint.map({ $0.isFinite && $0 > 0 }) ?? true,
               imageWidth > 0,
               imageHeight > 0 else {
             lastShotTransform.removeValue(forKey: pid)
@@ -951,8 +966,8 @@ public final class CommandRouter {
         let transform = ShotTransform(
             originX: originX,
             originY: originY,
-            pixelsPerPointX: Double(imageWidth) / pointWidth,
-            pixelsPerPointY: Double(imageHeight) / pointHeight,
+            pixelsPerPointX: pixelsPerPoint ?? Double(imageWidth) / pointWidth,
+            pixelsPerPointY: pixelsPerPoint ?? Double(imageHeight) / pointHeight,
             imageWidth: imageWidth,
             imageHeight: imageHeight,
             processIdentity: processIdentity,
@@ -1181,7 +1196,11 @@ public final class CommandRouter {
                     y: y,
                     pid: target.pid
                 )
-                await cursor.moveForAction(to: g, targetPid: target.pid)
+                // Official coordinate click/drag dispatch does not await a
+                // cursor animation. Start feedback without delaying input.
+                await cursor.moveForAction(
+                    to: g, targetPid: target.pid, waitForVisualFeedback: false
+                )
                 _ = try Self.validatedGlobalPoint(
                     x: x,
                     y: y,
@@ -1471,7 +1490,7 @@ public final class CommandRouter {
         return try await withForegroundLease(command: "paste", target: target) {
             _ = try Injection.validateAuthorizedTarget(target)
             try self.requireSnapshotProcess(target: target, expected: expected)
-            try await AXAction.pasteText(pid: target.pid, text, format: format)
+            try await pasteExecutor(target.pid, text, format)
             return .bool(true)
         }
     }
@@ -1545,7 +1564,9 @@ public final class CommandRouter {
                 pid: target.pid
             )
             await cursor.move(to: from, animated: false)
-            await cursor.moveForAction(to: to, targetPid: target.pid)
+            await cursor.moveForAction(
+                to: to, targetPid: target.pid, waitForVisualFeedback: false
+            )
 
             _ = try Self.validatedGlobalPoint(
                 x: rawFrom.x,

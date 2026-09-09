@@ -666,6 +666,31 @@ function parseKeyChord(text: string): string[] {
  * can't. The per-turn reset is the correctness boundary.
  */
 let mouseButtonHeld = false;
+// Internal binder identity. It is carried on overrides, never on the wire, so
+// a cancelled session cannot release another session's synthetic mouse press.
+export const WINDOWS_MOUSE_OWNER = Symbol('windowsComputerUseMouseOwner')
+export interface WindowsMouseOwner {
+  canRelease(): Promise<boolean>
+}
+let mouseButtonOwner: WindowsMouseOwner | undefined
+let mouseHoldGeneration = 0
+let pendingMouseRelease: { generation: number; promise: Promise<boolean> } | undefined
+
+function mouseOwner(overrides: ComputerUseOverrides): WindowsMouseOwner | undefined {
+  return (overrides as ComputerUseOverrides & { [WINDOWS_MOUSE_OWNER]?: WindowsMouseOwner })[WINDOWS_MOUSE_OWNER]
+}
+
+export function hasHeldMouseForSession(owner: WindowsMouseOwner): boolean {
+  return mouseButtonHeld && mouseButtonOwner === owner
+}
+
+/** Re-checks the owner and its host lock before sending the matching release. */
+export async function releaseHeldMouseForSession(
+  adapter: ComputerUseHostAdapter,
+  owner: WindowsMouseOwner,
+): Promise<boolean> {
+  return releaseHeldMouse(adapter, owner)
+}
 /** Whether mouse_move occurred between left_mouse_down and left_mouse_up.
  *  When false at mouseUp, the decomposed sequence is a click-release (not a
  *  drop) — hit-test at "mouse", not "mouse_full". */
@@ -677,6 +702,8 @@ let mouseMoved = false;
 export function resetMouseButtonHeld(): void {
   mouseButtonHeld = false;
   mouseMoved = false;
+  mouseButtonOwner = undefined
+  mouseHoldGeneration += 1
 }
 
 /** If a left_mouse_down set the OS button without a matching left_mouse_up
@@ -684,11 +711,28 @@ export function resetMouseButtonHeld(): void {
  *  handleClick. No-op when not held — callers don't need to check. */
 async function releaseHeldMouse(
   adapter: ComputerUseHostAdapter,
-): Promise<void> {
-  if (!mouseButtonHeld) return;
-  await adapter.executor.mouseUp();
-  mouseButtonHeld = false;
-  mouseMoved = false;
+  owner?: WindowsMouseOwner,
+): Promise<boolean> {
+  if (!mouseButtonHeld || (owner !== undefined && mouseButtonOwner !== owner)) return false
+  const generation = mouseHoldGeneration
+  if (pendingMouseRelease?.generation === generation) return pendingMouseRelease.promise
+  // Share only cleanup, not the Windows action dispatcher. Keep ownership on
+  // failure so a later cancellation can retry releasing this same press.
+  const promise = Promise.resolve().then(async () => {
+    if (owner && !await owner.canRelease()) return false
+    // Checking the host lock yields. A new lock holder can reset the old
+    // state and start a different press while that check is in flight.
+    if (!mouseButtonHeld || mouseHoldGeneration !== generation || (owner && mouseButtonOwner !== owner)) return false
+    await adapter.executor.mouseUp()
+    if (mouseHoldGeneration === generation) resetMouseButtonHeld()
+    return true
+  })
+  pendingMouseRelease = { generation, promise }
+  try {
+    return await promise
+  } finally {
+    if (pendingMouseRelease?.promise === promise) pendingMouseRelease = undefined
+  }
 }
 
 /**
@@ -1614,7 +1658,7 @@ async function executeTeachStep(
     // The host's Exit handler also calls stopSession, so the turn is
     // already unwinding. Caller decides what to return for the transcript.
     // A PREVIOUS step's left_mouse_down may have left the OS button held.
-    await releaseHeldMouse(adapter);
+    await releaseHeldMouse(adapter, mouseOwner(overrides));
     return { kind: "exit" };
   }
 
@@ -1644,7 +1688,7 @@ async function executeTeachStep(
     // this IS the exit path, just caught mid-dispatch instead of at the
     // onTeachStep await above. Callers already handle { kind: "exit" }.
     if (overrides.isAborted?.()) {
-      await releaseHeldMouse(adapter);
+      await releaseHeldMouse(adapter, mouseOwner(overrides));
       return { kind: "exit" };
     }
     // Same inter-step settle as handleComputerBatch.
@@ -1667,7 +1711,7 @@ async function executeTeachStep(
     results.push(result);
 
     if (inner.isError) {
-      await releaseHeldMouse(adapter);
+      await releaseHeldMouse(adapter, mouseOwner(overrides));
       return {
         kind: "action_error",
         executed: results.length - 1,
@@ -2161,9 +2205,7 @@ async function handleClickVariant(
   // click-tier and read-tier windows. Release first so click() gets a clean
   // slate.
   if (mouseButtonHeld) {
-    await adapter.executor.mouseUp();
-    mouseButtonHeld = false;
-    mouseMoved = false;
+    await releaseHeldMouse(adapter, mouseOwner(overrides));
   }
 
   const coord = extractCoordinate(args);
@@ -2496,9 +2538,7 @@ async function handleDrag(
   // the handleClickVariant clear above. Release first so drag() gets a
   // clean slate.
   if (mouseButtonHeld) {
-    await adapter.executor.mouseUp();
-    mouseButtonHeld = false;
-    mouseMoved = false;
+    await releaseHeldMouse(adapter, mouseOwner(overrides));
   }
 
   // `coordinate` is the END point
@@ -3009,6 +3049,8 @@ async function handleLeftMouseDown(
   await adapter.executor.mouseDown();
   mouseButtonHeld = true;
   mouseMoved = false;
+  mouseButtonOwner = mouseOwner(overrides)
+  mouseHoldGeneration += 1
   return okText("Mouse button pressed.");
 }
 
@@ -3035,8 +3077,7 @@ async function handleLeftMouseUp(
     err: CuCallToolResult,
   ): Promise<CuCallToolResult> => {
     await adapter.executor.mouseUp();
-    mouseButtonHeld = false;
-    mouseMoved = false;
+    resetMouseButtonHeld();
     return err;
   };
 
@@ -3062,8 +3103,7 @@ async function handleLeftMouseUp(
   if (hitGate) return releaseFirst(hitGate);
 
   await adapter.executor.mouseUp();
-  mouseButtonHeld = false;
-  mouseMoved = false;
+  resetMouseButtonHeld();
   return okText("Mouse button released.");
 }
 
@@ -3185,7 +3225,7 @@ async function handleComputerBatch(
     // host's await but not this loop — without this check the remaining
     // actions fire into a dead session.
     if (overrides.isAborted?.()) {
-      await releaseHeldMouse(adapter);
+      await releaseHeldMouse(adapter, mouseOwner(overrides));
       return errorResult(
         `Batch aborted after ${results.length} of ${actions.length} actions (user interrupt).`,
       );
@@ -3221,7 +3261,7 @@ async function handleComputerBatch(
       // Release held mouse: the error may be a mid-grapheme abort in
       // handleType, or a frontmost gate, landing between mouse_down and
       // mouse_up.
-      await releaseHeldMouse(adapter);
+      await releaseHeldMouse(adapter, mouseOwner(overrides));
       return okJson(
         {
           completed: results.slice(0, -1),
@@ -3390,6 +3430,11 @@ export async function handleToolCall(
   // state through to the renderer, which shows a TCC toggle panel instead
   // of the app list. Every other tool short-circuits here.
   const osPerms = await adapter.ensureOsPermissions();
+  if (overrides.isAborted?.()) {
+    // Permission checks can yield after the binder's cancellation check. The
+    // binder still owns held-mouse cleanup; do not dispatch a new input here.
+    return errorResult('Computer Use cancelled before dispatch.')
+  }
   let tccState:
     | { accessibility: boolean; screenRecording: boolean }
     | undefined;
