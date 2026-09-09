@@ -10,6 +10,7 @@
  */
 
 import { getOpenAIPolicyError } from '../../services/openaiAuth/policyError.js'
+import { buildOpenaiEndpoint } from './openaiEndpoint.js'
 import { normalizeAnthropicBaseUrl } from '../../services/api/anthropicBaseUrl.js'
 import { createGunzip, createInflate } from 'node:zlib'
 
@@ -663,7 +664,7 @@ async function handleOpenaiChat(
     passThinkingToggle: knownDeepSeekHost,
     imageContentMode: shouldUseTextOnlyOpenAIChatContent(baseUrl, body.model) ? 'text_only' : 'vision',
   })
-  const url = `${baseUrl}/v1/chat/completions`
+  const url = buildOpenaiEndpoint(baseUrl, 'chat/completions')
   const upstreamRequestHeaders = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`,
@@ -860,7 +861,7 @@ async function handleOpenaiResponses(
   promptCacheKey?: string,
 ): Promise<Response> {
   const transformed = anthropicToOpenaiResponses(body, { cacheKey: promptCacheKey })
-  const url = `${baseUrl}/v1/responses`
+  const url = buildOpenaiEndpoint(baseUrl, 'responses')
   const upstreamRequestHeaders = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${apiKey}`,
